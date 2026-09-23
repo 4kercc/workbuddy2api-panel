@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -637,6 +638,98 @@ func TestPromptFileOverride(t *testing.T) {
 	}
 	if c.PromptText != want {
 		t.Errorf("PromptText=%q want %q", c.PromptText, want)
+	}
+}
+
+// TestPromptTextInline 内联 prompt.text 生效，且优先于同存的 file（来源记 inline）。
+// 面板里写提示词是主路径；若 file 能盖掉内联内容，用户会以为改了、实际没改。
+func TestPromptTextInline(t *testing.T) {
+	dir := t.TempDir()
+	pf := filepath.Join(dir, "my.md")
+	os.WriteFile(pf, []byte("文件里的人格"), 0o600)
+	cf := filepath.Join(dir, "c.json")
+	cfgJSON, err := json.Marshal(map[string]any{"prompt": map[string]any{
+		"mode": "custom", "file": pf, "text": "面板里的人格",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(cf, cfgJSON, 0o600)
+
+	c, err := Load(cf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PromptText != "面板里的人格" {
+		t.Errorf("PromptText=%q want 面板里的人格", c.PromptText)
+	}
+	if c.PromptSource != "inline" {
+		t.Errorf("PromptSource=%q want inline", c.PromptSource)
+	}
+}
+
+// TestPromptSourceKinds PromptSource 标注须与实际生效来源一致：
+// passthrough→none，file→file，仅内联→inline，都不给→builtin。
+func TestPromptSourceKinds(t *testing.T) {
+	dir := t.TempDir()
+	pf := filepath.Join(dir, "my.md")
+	os.WriteFile(pf, []byte("来自文件"), 0o600)
+
+	cases := []struct {
+		name       string
+		promptCfg  map[string]any
+		wantSource string
+		wantText   string
+	}{
+		{"passthrough 不注入", map[string]any{"mode": "passthrough", "text": "被忽略"}, "none", ""},
+		{"仅文件", map[string]any{"mode": "custom", "file": pf}, "file", "来自文件"},
+		{"仅内联", map[string]any{"mode": "custom", "text": "来自面板"}, "inline", "来自面板"},
+		{"都不给回落内置", map[string]any{"mode": "custom"}, "builtin", ""},
+		{"空白内联视同未填", map[string]any{"mode": "custom", "text": "  \n "}, "builtin", ""},
+	}
+	for i, tc := range cases {
+		cf := filepath.Join(dir, fmt.Sprintf("c%d.json", i))
+		cfgJSON, err := json.Marshal(map[string]any{"prompt": tc.promptCfg})
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.WriteFile(cf, cfgJSON, 0o600)
+
+		c, err := Load(cf)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if c.PromptSource != tc.wantSource {
+			t.Errorf("%s: PromptSource=%q want %q", tc.name, c.PromptSource, tc.wantSource)
+		}
+		if tc.wantText != "" && c.PromptText != tc.wantText {
+			t.Errorf("%s: PromptText=%q want %q", tc.name, c.PromptText, tc.wantText)
+		}
+		if tc.wantSource == "builtin" && len(c.PromptText) == 0 {
+			t.Errorf("%s: 回落内置默认时 PromptText 不该为空", tc.name)
+		}
+	}
+}
+
+// TestNormalizeCrossRealmModels 白名单归一化：trim / 丢空项 / 去重 / 空列表转 nil。
+// 归一化放在这里而不是选号路径：选号是每请求热路径，不该反复做 trim 比较。
+func TestNormalizeCrossRealmModels(t *testing.T) {
+	c := Default()
+	c.Routing.CrossRealmModels = []string{" deepseek-v4.1-flash ", "", "glm-5.3-flash", "deepseek-v4.1-flash", "  "}
+	c.normalizeRouting()
+	got := c.Routing.CrossRealmModels
+	if len(got) != 2 || got[0] != "deepseek-v4.1-flash" || got[1] != "glm-5.3-flash" {
+		t.Errorf("归一化结果 = %v, want [deepseek-v4.1-flash glm-5.3-flash]", got)
+	}
+
+	// 空/全空白列表统一转 nil（nil 与 [] 在选号路径语义相同，统一形状便于比较）
+	for _, in := range [][]string{nil, {}, {"", "   "}} {
+		c2 := Default()
+		c2.Routing.CrossRealmModels = in
+		c2.normalizeRouting()
+		if c2.Routing.CrossRealmModels != nil {
+			t.Errorf("in=%v 应归一为 nil, got %v", in, c2.Routing.CrossRealmModels)
+		}
 	}
 }
 

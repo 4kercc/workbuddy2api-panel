@@ -101,6 +101,20 @@ func main() {
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 
+	// live 承载可热改字段（api_key / soft_rate / 脱敏开关 / 系统提示词 / 面板汇聚 /
+	// 跨域模型白名单），面板保存配置时在线替换。**必须早于会话粘性装配**：粘性的
+	// AvailableForModel 闭包要读跨域白名单决定可用账号集，口径必须与 chat 选号一致。
+	live := livecfg.New(livecfg.Snapshot{
+		APIKey:               cfg.APIKey,
+		SoftCooldown:         cfg.SoftRateDur,
+		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
+		PromptMode:           cfg.Prompt.Mode,
+		PromptText:           cfg.PromptText,
+		PromptSource:         cfg.PromptSource,
+		PanelModelMerge:      cfg.Panel.ModelMerge,
+		CrossRealmModels:     cfg.Routing.CrossRealmModels,
+	})
+
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
 	redisMode := "noop"
@@ -114,8 +128,8 @@ func main() {
 			Store:      store,
 			Available:  p.AvailableUIDs,
 			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏）；
-			// 裸名走 cn（现状零回归）。闭包内部 resolveModel 剥前缀，再按 realm 过滤。
-			AvailableForModel: realmAwareAvailableForModel(p),
+			// 裸名走 cn、命中跨域白名单则两域同候选（与 chat 选号同口径，见 ResolveRoute）。
+			AvailableForModel: realmAwareAvailableForModel(p, live),
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
@@ -214,12 +228,6 @@ func main() {
 
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
 	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
-	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
-	live := livecfg.New(livecfg.Snapshot{
-		APIKey:               cfg.APIKey,
-		SoftCooldown:         cfg.SoftRateDur,
-		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
-	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
 	usagePath := usagePathFor(cfg.StateFile)
@@ -248,6 +256,14 @@ func main() {
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
 			return saveConfig(raw, *cfgPath, live, p, up, sch)
+		},
+		// 当前生效的系统提示词（模式/文本/来源），供面板「配置」页展示与"载入当前生效"。
+		// 读 Live 快照而非启动期 cfg：面板保存后立即反映新值，不会显示过期内容。
+		PromptInfo: func() panel.PromptSnapshot {
+			if s := live.Load(); s.PromptMode != "" {
+				return panel.PromptSnapshot{Mode: s.PromptMode, Text: s.PromptText, Source: s.PromptSource}
+			}
+			return panel.PromptSnapshot{Mode: cfg.Prompt.Mode, Text: cfg.PromptText, Source: cfg.PromptSource}
 		},
 	})
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
@@ -391,6 +407,11 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		APIKey:               newCfg.APIKey,
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
+		PromptMode:           newCfg.Prompt.Mode,
+		PromptText:           newCfg.PromptText,
+		PromptSource:         newCfg.PromptSource,
+		PanelModelMerge:      newCfg.Panel.ModelMerge,
+		CrossRealmModels:     newCfg.Routing.CrossRealmModels,
 	})
 	up.SanitizeFingerprints = newCfg.Features.SanitizeBlacklistFingerprints
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)

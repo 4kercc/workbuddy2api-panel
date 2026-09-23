@@ -61,6 +61,10 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// PromptInfo 返回当前生效的系统提示词（模式/文本/来源），供「配置」页展示与
+	// 「载入当前生效」改写。nil 时 prompt 端点返回 501。
+	PromptInfo func() PromptSnapshot
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -152,6 +156,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
+	p.mux.HandleFunc("POST /panel/api/import/auths", p.withAuth(p.importAuths))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
@@ -180,6 +185,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	p.mux.HandleFunc("GET /panel/api/prompt", p.withAuth(p.promptInfo))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -292,7 +298,22 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+
+	// 模型汇聚（可选，纯展示）：两域同名模型合并成一条，仅单域存在的保持独立。
+	merged := p.modelMergeEnabled()
+	if merged {
+		out = mergeModelEntries(out)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out, "merged": merged})
+}
+
+// modelMergeEnabled 报告「模型汇聚」开关是否开启（Live 快照优先；无 Live 时视为关闭）。
+// 纯展示开关：不参与任何转发与选号决策，也不改变 /v1/models 的带前缀命名。
+func (p *Panel) modelMergeEnabled() bool {
+	if p.cfg.Live == nil {
+		return false
+	}
+	return p.cfg.Live.Load().PanelModelMerge
 }
 
 // panelModelEntry 构造单个模型条目（两域共用）：id 带 realm 前缀（调用值即显示值），

@@ -113,10 +113,43 @@ type Config struct {
 		// File 提示词文件路径；空 = 内置默认 defaultprompt.md；
 		// 路径非空但不可读 → 启动报错（fail fast，避免静默回落到内置默认）。
 		File string `json:"file"`
+		// Text 内联提示词内容（面板「配置」页直接编辑）。非空时优先于 File：
+		// 面板里写提示词是主路径，File 保留给需要挂载外部文件或纳入版本管理的部署。
+		Text string `json:"text"`
 	} `json:"prompt"`
 
 	// PromptText 解析后的系统提示词文本（custom/append 模式使用）。
 	PromptText string `json:"-"`
+	// PromptSource 上述文本的来源（prompt.SourceInline/File/Builtin；passthrough 下为 "none"）。
+	// 供面板展示"当前生效的提示词从哪来"，避免改了内联内容却以为文件在生效。
+	PromptSource string `json:"-"`
+
+	// Panel 管理面板自身的行为开关（只影响面板展示，不参与网关转发与选号）。
+	Panel struct {
+		// ModelMerge 「模型与档位」视图把两域同名模型汇聚成一条显示，仅单域存在的保持独立。
+		//
+		// 刻意只作用于面板展示，**不作用于 /v1/models**：model 名的 realm 前缀是网关侧
+		// 路由信号（resolveModel），而无前缀默认判 cn —— 若把 /v1/models 也汇聚成裸名，
+		// global 独有模型会被静默路由到 CN 账号去打上游不存在的模型。
+		//
+		// 汇聚时同名模型两域的元数据（积分倍率/最大输出/思考档位/能力旗标）实测常不同，
+		// 故不取其一，而是两值都保留（见 panel.mergeModelEntries）。
+		ModelMerge bool `json:"model_merge"`
+	} `json:"panel"`
+
+	// Routing 模型名 → 选号域 的路由规则（只影响选哪一域的账号，不改出站模型名）。
+	Routing struct {
+		// CrossRealmModels 跨域模型白名单：**裸模型名**（不带 cn:/global: 前缀）命中时，
+		// 该请求不做选号域过滤，CN 与 global 账号同为候选。
+		//
+		// 用途：同一模型名在两域都存在、希望合并使用时（如 deepseek-v4.1-flash），
+		// 客户端无需区分前缀，网关按池内既有策略（成本分层 + 三因子加权）在**两域**账号间选号。
+		// 显式 "cn:" / "global:" 前缀仍然锁域 —— 显式意图不被配置覆盖。
+		//
+		// 前提：该模型在两域上游都真实存在。只存在于单域的模型写进来后，被选到另一域账号
+		// 会打上游不存在的模型而失败；配置期无法校验（要真实探测上游），属配置方责任。
+		CrossRealmModels []string `json:"cross_realm_models"`
+	} `json:"routing"`
 
 	Upstash struct {
 		URL   string `json:"url"`   // 空 = 纯内存模式；支持完整 rediss:// URL 或 https://xxx.upstash.io host
@@ -368,6 +401,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_PROMPT_FILE"); v != "" {
 		c.Prompt.File = v
 	}
+	if v := os.Getenv("WB2A_PROMPT_TEXT"); v != "" {
+		c.Prompt.Text = v
+	}
 	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
 		c.Pool.ExpiringSoon = v
 	}
@@ -485,15 +521,42 @@ func (c *Config) normalize() error {
 	if err := c.validateScheduleHours(); err != nil {
 		return err
 	}
+	c.normalizeRouting()
 	return c.normalizePrompt()
+}
+
+// normalizeRouting 归一化 routing.cross_realm_models：去首尾空白、丢空项、去重
+// （保持首次出现顺序）。这样配置里写 " deepseek-v4.1-flash " 或重复项都能正常工作，
+// 不必让下游选号路径反复 trim 比较。
+func (c *Config) normalizeRouting() {
+	if len(c.Routing.CrossRealmModels) == 0 {
+		c.Routing.CrossRealmModels = nil
+		return
+	}
+	seen := make(map[string]bool, len(c.Routing.CrossRealmModels))
+	out := make([]string, 0, len(c.Routing.CrossRealmModels))
+	for _, m := range c.Routing.CrossRealmModels {
+		m = strings.TrimSpace(m)
+		if m == "" || seen[m] {
+			continue
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	if len(out) == 0 {
+		c.Routing.CrossRealmModels = nil
+		return
+	}
+	c.Routing.CrossRealmModels = out
 }
 
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。
 //
 // mode 非法（非 passthrough/custom/append）启动报错，避免静默回落到某一分支；
-// custom/append 模式下 file 非空但不可读 → 报错（fail fast），file 空 → 用内置默认
-// （两模式共用同一加载路径，PromptText 均非空）。
-// passthrough 模式不加载文本（透传客户端原始 system，文本在降级时用 prompt.Degraded）。
+// custom/append 模式下按 text > file > 内置默认 取文本（text 非空即以内联为准）；
+// file 非空但不可读 → 报错（fail fast，避免静默回落到内置默认）。
+// passthrough 模式不加载文本（透传客户端原始 system，文本在降级时用 prompt.Degraded），
+// PromptSource 记 "none"。
 func (c *Config) normalizePrompt() error {
 	switch m := strings.ToLower(strings.TrimSpace(c.Prompt.Mode)); m {
 	case "", "passthrough":
@@ -505,13 +568,17 @@ func (c *Config) normalizePrompt() error {
 	default:
 		return fmt.Errorf("prompt.mode: %q 不是合法值（passthrough / custom / append）", c.Prompt.Mode)
 	}
-	if c.Prompt.Mode == "custom" || c.Prompt.Mode == "append" {
-		text, err := prompt.Load(c.Prompt.Mode, c.Prompt.File)
-		if err != nil {
-			return err
-		}
-		c.PromptText = text
+	if c.Prompt.Mode == "passthrough" {
+		c.PromptText = ""
+		c.PromptSource = "none"
+		return nil
 	}
+	text, source, err := prompt.Load(c.Prompt.Mode, c.Prompt.File, c.Prompt.Text)
+	if err != nil {
+		return err
+	}
+	c.PromptText = text
+	c.PromptSource = source
 	return nil
 }
 

@@ -87,9 +87,6 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// 按 domain 推断 realm：workbuddy.ai 家族 → global，否则 cn。
-		realm := auth.ResolveRealm("", acc.Domain)
-
 		// cockpit tools 的 expires_at 为毫秒时间戳，转为秒。
 		expiresAt := acc.ExpiresAt / 1000
 		if expiresAt <= 0 {
@@ -111,46 +108,11 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 			FilePath:     filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", uid)),
 		}
 
-		if realm == "global" {
-			if _, err := auth.BackfillRealmFor(a, "global"); err != nil {
-				skipped++
-				errs = append(errs, fmt.Sprintf("uid=%s: set realm failed: %v", uid, err))
-				continue
-			}
-		} else {
-			_, _ = a.BackfillRealm()
-		}
-
-		if err := a.SaveAtomic(); err != nil {
+		if err := p.importAccount(a); err != nil {
 			skipped++
-			errs = append(errs, fmt.Sprintf("uid=%s: save auth failed: %v", uid, err))
+			errs = append(errs, fmt.Sprintf("uid=%s: %v", uid, err))
 			continue
 		}
-
-		p.cfg.Pool.Add(a)
-		p.cfg.Pool.Revive(uid)
-
-		// 顺带签到/激活（幂等；失败仅记日志，不阻断导入）。
-		if realm == "global" {
-			if activated, err := p.cfg.Upstream.GlobalCompleteRegistration(a); err != nil {
-				log.Printf("panel: import global 注册激活 uid=%s: %v", uid, err)
-			} else if activated {
-				log.Printf("panel: import global 注册激活 uid=%s 完成", uid)
-			}
-			if claimed, err := p.cfg.Upstream.ClaimTrial(a); err != nil {
-				log.Printf("panel: import global trial uid=%s: %v", uid, err)
-			} else if claimed {
-				log.Printf("panel: import global trial uid=%s 已领", uid)
-			}
-		} else {
-			if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-				log.Printf("panel: import checkin uid=%s: %v", uid, err)
-			}
-		}
-		if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
-			p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
-		}
-
 		imported++
 	}
 
@@ -178,4 +140,75 @@ func validImportUID(uid string) bool {
 		}
 	}
 	return true
+}
+
+// importAccount 把一个已归一化的账号落盘、热加载进池，并顺带签到/激活与余额刷新。
+// 两条导入路径（cockpit 导出 / 本地部署 auths 目录）共用此函数。
+//
+// 返回 error 仅表示凭证落盘失败（账号未导入）；落盘成功后的附属动作失败只记日志——
+// 账号此刻已可用，不该因签到失败而回滚。
+//
+// realm 判定统一走 ResolveRealm(存储标识, domain)：显式标识优先，否则按 domain 后缀推断。
+// 这里不用 Auth.IsGlobal()，因为后者受 global 逃生门影响（关掉即恒判 cn），会把 global
+// 账号的 realm 写死成 cn 永久污染凭证——逃生门只该锁路由，不该改写落盘数据。
+func (p *Panel) importAccount(a *auth.Auth) error {
+	uid := a.UID
+	realm := auth.ResolveRealm(normalizeStoredRealm(a.RealmStored()), a.DomainValue())
+
+	if realm == "global" {
+		if _, err := auth.BackfillRealmFor(a, "global"); err != nil {
+			return fmt.Errorf("set realm: %w", err)
+		}
+	} else {
+		_, _ = a.BackfillRealm()
+	}
+
+	if err := a.SaveAtomic(); err != nil {
+		return fmt.Errorf("save auth: %w", err)
+	}
+
+	p.cfg.Pool.Add(a)
+	p.cfg.Pool.Revive(uid) // 导入 = 人工恢复口径：清掉同 uid 旧条目遗留的禁用/冷却/熔断
+
+	p.importSideEffects(a, realm)
+	return nil
+}
+
+// normalizeStoredRealm 归一化 auth 文件里的 realm 标识：仅 cn/global 有效（大小写与空白
+// 不敏感），其余（空/脏值）返回 "" 交给 domain 推断，避免脏值被 BackfillRealmFor 拒绝。
+func normalizeStoredRealm(r string) string {
+	switch v := strings.ToLower(strings.TrimSpace(r)); v {
+	case "cn", "global":
+		return v
+	}
+	return ""
+}
+
+// importSideEffects 导入成功后的尽力而为动作：global 走注册激活 + trial 领取，cn 走每日
+// 签到；随后刷新余额并按积分解冻账号。全部幂等，失败只记日志不阻断导入。
+// Upstream 未注入（测试 / 裁剪部署）时整体跳过。
+func (p *Panel) importSideEffects(a *auth.Auth, realm string) {
+	if p.cfg.Upstream == nil {
+		return
+	}
+	uid := a.UID
+	if realm == "global" {
+		if activated, err := p.cfg.Upstream.GlobalCompleteRegistration(a); err != nil {
+			log.Printf("panel: import global 注册激活 uid=%s: %v", uid, err)
+		} else if activated {
+			log.Printf("panel: import global 注册激活 uid=%s 完成", uid)
+		}
+		if claimed, err := p.cfg.Upstream.ClaimTrial(a); err != nil {
+			log.Printf("panel: import global trial uid=%s: %v", uid, err)
+		} else if claimed {
+			log.Printf("panel: import global trial uid=%s 已领", uid)
+		}
+	} else {
+		if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
+			log.Printf("panel: import checkin uid=%s: %v", uid, err)
+		}
+	}
+	if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
+		p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
+	}
 }

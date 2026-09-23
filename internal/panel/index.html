@@ -162,11 +162,19 @@ button.danger { color: var(--bad); }
 button.danger:hover:not(:disabled) { border-color: var(--bad); }
 button.xs { padding: 3.5px 9px; font-size: 12.5px; border-radius: 6px; }
 button.icon { padding: 7px 9px; }
-input, select {
+input, select, textarea {
   font: inherit; color: var(--ink); background: var(--surface-2);
   border: 1px solid var(--line); border-radius: 7px; padding: 7px 11px; width: 100%;
 }
-input:focus, select:focus { outline: none; border-color: var(--accent); }
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+/* 提示词正文是长文本，等宽字体便于对齐与审阅；可纵向拉伸，宽度跟随容器。 */
+textarea { font-family: var(--mono); font-size: 12.5px; line-height: 1.55; resize: vertical; min-height: 120px; }
+/* 模型汇聚行的域标注：仅在该列两域取值不同时出现，指明左边这个值属于哪个域。 */
+.ms { font-style: normal; font-size: 10.5px; color: var(--ink-3); margin-left: 4px; vertical-align: 1px; }
+/* 汇聚行差异列的逐域分行：每域一行（上行 CN、下行 Global），值 + 行尾域标注。
+   行内标签（思考档位）超出列宽时自然折行，不会溢出到相邻列。 */
+.mv > .mvr { display: block; }
+.mv > .mvr + .mvr { margin-top: 2px; }
 input.invalid { border-color: var(--bad); background: var(--bad-soft); }
 input.invalid:focus { border-color: var(--bad); }
 input[type=checkbox] { width: auto; accent-color: var(--accent); }
@@ -781,16 +789,29 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                   <option value="append">append — 客户端 system 后插网关提示词（并用）</option>
                   <option value="passthrough">passthrough — 透传客户端原始 system</option>
                 </select>
-                <span class="hint">需重启</span></label>
+                <span class="hint">保存后即时生效</span></label>
               <label class="fld"><span class="lb">提示词文件路径</span>
                 <input name="prompt_file" placeholder="留空 = 内置默认提示词">
-                <span class="hint">需重启</span></label>
+                <span class="hint">下方内容框非空时此项被忽略</span></label>
+            </div>
+            <label class="fld"><span class="lb">系统提示词内容</span>
+              <textarea name="prompt_text" rows="12" placeholder="留空 = 用文件或内置默认；填入即在每轮对话出站前注入此文本"></textarea>
+              <span class="hint" id="promptSource"></span></label>
+            <div class="inline" style="margin:-6px 0 14px">
+              <button id="btnLoadPrompt" type="button">载入当前生效</button>
+              <span class="hint">把网关此刻实际注入的文本填进上方内容框，便于在此基础上改写</span>
             </div>
             <div class="hr"></div>
             <div class="switch"><span class="lb">出站请求指纹脱敏</span>
               <input type="checkbox" name="sanitize_blacklist_fingerprints"></div>
             <div class="switch"><span class="lb">会话粘性路由</span>
               <input type="checkbox" name="session_sticky_enabled"></div>
+            <div class="switch"><span class="lb">模型汇聚</span>
+              <input type="checkbox" name="panel_model_merge"></div>
+            <div class="hint" style="margin-top:6px">开启后「模型与档位」把两域同名模型合并为一行，仅单域存在的仍单独列出；同名模型两域的上限/倍率不同时并排显示。仅影响面板展示，<b>不改变 /v1/models 的带前缀命名</b>（前缀即选号路由信号）。</div>
+            <label class="fld" style="margin-top:14px"><span class="lb">跨域模型（裸模型名，逗号分隔）</span>
+              <input name="cross_realm_models" placeholder="如 deepseek-v4.1-flash">
+              <span class="hint">列出的模型用<b>裸名</b>请求时不做域过滤，国内与国际账号同为候选，按池内既有策略（成本分层 + 加权）选号；显式 <b>cn:</b> / <b>global:</b> 前缀仍锁域。前提：该模型在两域上游都真实存在，否则被选到另一域账号会打上游不存在的模型而失败。</span></label>
             <div class="hint" style="margin-top:10px">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>
           </div>
         </div>
@@ -876,6 +897,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="tabs" id="addTabs">
         <button class="tab on" data-tab="login">浏览器登录</button>
         <button class="tab" data-tab="import">导入 JSON</button>
+        <button class="tab" data-tab="auths">导入本地部署</button>
       </div>
     </header>
     <div class="body">
@@ -904,6 +926,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <input type="file" id="importFile" accept=".json" style="margin-bottom:8px">
         <div id="importDone" class="state ok" hidden></div>
         <div id="importErr" class="state err" hidden></div>
+      </div>
+      <!-- 导入本地部署（auths 目录） -->
+      <div id="addTabAuths" class="tab-panel" hidden>
+        <div class="hint" style="margin-bottom:8px">导入本地部署 auths 目录下的 workbuddy-*.json，把本地已登录的账号直接搬到服务器，无需重新走 OAuth。嵌套形与扁平形自动识别，目录里混入的 state.json / usage.json 会自动跳过。</div>
+        <div class="hint" style="font-size:12px;margin-bottom:4px">选择凭证文件（可多选）：</div>
+        <input type="file" id="authsFiles" multiple accept=".json" style="margin-bottom:8px">
+        <div class="hint" style="font-size:12px;margin-bottom:4px">或直接选择整个 auths 文件夹：</div>
+        <input type="file" id="authsDir" webkitdirectory directory multiple style="margin-bottom:8px">
+        <div id="authsDone" class="state ok" hidden></div>
+        <div id="authsErr" class="state err" hidden></div>
       </div>
     </div>
     <footer>

@@ -18,6 +18,23 @@ type Snapshot struct {
 	APIKey               string        // 网关/面板共同鉴权密钥；空 = 不鉴权
 	SoftCooldown         time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
 	SanitizeFingerprints bool          // 出站请求体指纹脱敏
+
+	// 系统提示词（custom/append 模式在出站前注入）。此前是 handler 的静态字段，
+	// 面板改了不生效也不提示重启（静默失效），故收编进快照以支持热生效。
+	// PromptMode 空 = 快照未携带该组字段，调用方回退静态值（测试/裸用场景）。
+	PromptMode   string
+	PromptText   string
+	PromptSource string // inline / file / builtin / none，仅用于面板展示来源
+
+	// PanelModelMerge 面板「模型与档位」视图汇聚两域同名模型（纯展示开关，
+	// 不影响 /v1/models 与选号路由）。面板保存配置后立即生效。
+	PanelModelMerge bool
+
+	// CrossRealmModels 跨域模型白名单（routing.cross_realm_models）：**裸模型名**命中时
+	// 该请求不做选号域过滤，CN 与 global 账号同为候选 —— 让同一个模型名在两域账号间通用。
+	// 显式 "cn:" / "global:" 前缀仍然锁域（显式意图不被配置覆盖）。
+	// 元素应为裸名（不带前缀）；切片在快照里按只读使用，Store 时整体替换。
+	CrossRealmModels []string
 }
 
 // Holder 原子持有当前快照。

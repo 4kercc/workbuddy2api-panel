@@ -43,7 +43,14 @@
   },
   "prompt": {
     "mode": "passthrough",
-    "file": ""
+    "file": "",
+    "text": ""
+  },
+  "panel": {
+    "model_merge": false
+  },
+  "routing": {
+    "cross_realm_models": []
   },
   "upstash": {
     "url": "",

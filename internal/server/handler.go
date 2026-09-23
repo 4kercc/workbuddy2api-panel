@@ -86,6 +86,18 @@ func (h *Handler) softCooldown() time.Duration {
 	return 600 * time.Second
 }
 
+// promptCfg 返回当前生效的系统提示词模式与文本。
+//
+// 优先级：Live 快照（面板在线改，立即生效）→ 静态字段（启动时注入，测试/裸用）。
+// 快照未携带该组字段时 PromptMode 为空，此时整体回落到静态值，避免"快照存在
+// 但只装了 api_key"的场景把提示词误判成 passthrough（静默关闭注入）。
+func (h *Handler) promptCfg() (mode, text string) {
+	if s := h.loadLive(); s.PromptMode != "" {
+		return s.PromptMode, s.PromptText
+	}
+	return h.cfg.PromptMode, h.cfg.PromptText
+}
+
 // notFoundCooldown 上游 404 的固定短冷却时长。
 // 与 SoftCooldown 分流的原因：404 是上游**偶发**路径缺失，不是"本账号在限流"，
 // 若共用 soft_rate（600s 起 + 指数升级），一次偶发 404 会把好账号罚 10 分钟并逐次加倍。
@@ -485,10 +497,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(body, &peek)
 
-	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
-	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
-	// 裸名 → ("cn", 原串)，CN 现状零回归。
-	realm, bareModel := resolveModel(peek.Model)
+	// realm 前缀解析（D6）+ 跨域白名单：model 名可能带 "[realm:]" 前缀。剥出 realm +
+	// bareModel，bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认
+	// 裸名）。显式前缀锁域；裸名命中 routing.cross_realm_models 时 realm="" —— 池内语义为
+	// 不做域过滤，两域账号同为候选（同一模型名跨域使用）；其余裸名 → cn（现状零回归）。
+	realm, bareModel := ResolveRoute(peek.Model, h.loadLive().CrossRealmModels)
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
@@ -597,11 +610,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 降级裁决：append 在降级期退化为 replace（Rewrite(Degraded)）——append 带
 	// 指纹原文重试是确定性再撞墙，replace 是一次性最小抢救（issue #129 设计 §4）。
 	degradedApplied := false
-	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
-		body = prompt.Rewrite(body, h.cfg.PromptText)
-	} else if h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !h.degrade.Active() {
-		body = prompt.Append(body, h.cfg.PromptText)
-	} else if (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && h.degrade.Active() {
+	promptMode, promptText := h.promptCfg()
+	if promptMode == "custom" && promptText != "" {
+		body = prompt.Rewrite(body, promptText)
+	} else if promptMode == "append" && promptText != "" && !h.degrade.Active() {
+		body = prompt.Append(body, promptText)
+	} else if (promptMode == "passthrough" || promptMode == "append") && h.degrade.Active() {
 		body = prompt.Rewrite(body, prompt.Degraded)
 		degradedApplied = true
 	}
@@ -743,7 +757,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 降级重试同样退化为 replace——原文在场只会确定性再撞 400）。
 			// 第二次仍被拦（用户内容本身触发审核）→ 回内容防火墙错误（见下分支）。
 			// 内容问题非账号问题：applyErrorPolicy 不罚账号（见 ErrContentBlocked 分支）。
-			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !degradedApplied {
+			if kind == upstream.ErrContentBlocked && (promptMode == "passthrough" || promptMode == "append") && !degradedApplied {
 				h.degrade.Trigger()
 				body = prompt.Rewrite(body, prompt.Degraded)
 				degradedApplied = true

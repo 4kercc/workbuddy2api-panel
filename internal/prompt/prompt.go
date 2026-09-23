@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 )
 
 //go:embed defaultprompt.md
@@ -24,21 +25,36 @@ var defaultPrompt string
 // system 来源的误报，不改变用户指令的合法性语义。
 const Degraded = "You are a helpful assistant. Respond in the user's language, follow the user's instructions, and be direct and concise."
 
-// Load 按 mode 与 file 加载系统提示词文本。
-//   - file 非空 → 读文件（不存在/读失败返回 error，调用方 fail fast）；
-//   - file 空 → 返回内置 defaultPrompt。
+// 提示词来源标识（Load 的第二返回值，供面板展示"当前生效的提示词从哪来"）。
+const (
+	SourceInline  = "inline"  // config prompt.text 内联内容
+	SourceFile    = "file"    // config prompt.file 指向的文件
+	SourceBuiltin = "builtin" // 内置 defaultprompt.md
+)
+
+// Load 按内联内容 / 文件 / 内置默认的优先级取系统提示词文本，并报告来源。
 //
-// mode 在此仅做透传记录（实际 custom/passthrough 路由由调用方决定），
-// Load 只负责"拿到一段提示词文本"，不关心路由语义。
-func Load(mode, file string) (string, error) {
+//	inline 非空（去空白后）→ 用它，source=inline；
+//	否则 file 非空      → 读文件，source=file（不存在/读失败返回 error，调用方 fail fast）；
+//	否则                → 内置 defaultPrompt，source=builtin。
+//
+// 内联优先于文件：面板直接编辑提示词是主路径，File 保留给需要挂载外部文件
+// 或纳入版本管理的部署；两者同时存在时以内联为准，避免"改了面板却被文件盖掉"。
+//
+// mode 在此仅做透传记录（custom/passthrough/append 的路由由调用方决定），
+// Load 只负责"拿到一段提示词文本 + 它的来源"，不关心路由语义。
+func Load(mode, file, inline string) (string, string, error) {
+	if strings.TrimSpace(inline) != "" {
+		return inline, SourceInline, nil
+	}
 	if file == "" {
-		return defaultPrompt, nil
+		return defaultPrompt, SourceBuiltin, nil
 	}
 	raw, err := os.ReadFile(file)
 	if err != nil {
-		return "", fmt.Errorf("prompt file %s: %w", file, err)
+		return "", "", fmt.Errorf("prompt file %s: %w", file, err)
 	}
-	return string(raw), nil
+	return string(raw), SourceFile, nil
 }
 
 // Rewrite 解析 OpenAI 请求体并替换系统提示词：

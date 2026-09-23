@@ -314,6 +314,67 @@ function outCell(m, pr) {
   return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ink-3)">?</span><div class="note">未测出' + stale + '</div></td>';
 }
 
+/* ── 模型汇聚行的渲染（开关见配置页「模型汇聚」）────────────────────
+   同名模型两域的积分倍率/最大输出/思考档位实测常不同（如 global 的 glm-5.3-flash
+   最大输出 32000，只有 CN 的 1/4），因此不取其一：逐列对比，值不同时两域的值都列出
+   并标注域标签，值相同时只显示一次。仅单域存在的模型由后端保持独立条目，走普通行。 */
+const RLABEL = { cn: 'CN', global: 'Global' };
+function realmOf(v) { return String((v && v.id) || '').split(':')[0]; }
+// multiCell 逐列渲染：各域取值一致 → 单值；不一致 → 每域一行（上行 CN、下行 Global）。
+// 用分行而非行内拼接：差异列（尤其思考档位是多标签）行内拼会连成一长串
+// 「low high maxCNhighGlobal」，域归属无法分辨；分行后一眼看清哪行属于哪个域。
+// 行高由最高的列决定，故其余差异列一并分行不额外增高。
+function multiCell(vals, fmt) {
+  const uniq = new Set(vals.map(x => JSON.stringify(x.raw)));
+  if (uniq.size <= 1) return fmt(vals[0].raw);
+  return '<div class="mv">' + vals.map(x =>
+    '<div class="mvr">' + fmt(x.raw) + '<i class="ms">' + esc(RLABEL[x.realm] || x.realm) + '</i></div>'
+  ).join('') + '</div>';
+}
+// mergedRow 汇聚行：id 用裸名 + 域徽标，各列按 multiCell 逐域对比。
+function mergedRow(m, probeOf) {
+  const vs = m.variants || [];
+  const pick = k => vs.map(v => ({ realm: realmOf(v), raw: v[k] }));
+  const effHtml = raw => {
+    const eff = (raw || []).slice();
+    return eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
+      : '<span style="color:var(--ink-3);font-size:12.5px">—</span>';
+  };
+  const badges = (m.realms || []).map(r =>
+    '<span class="tag ' + (r === 'cn' ? 'ok' : 'warn') + '">' + esc(RLABEL[r] || r) + '</span>').join(' ');
+  const caps = [];
+  if (vs.some(v => v.is_default)) caps.push('<span class="tag ok">默认</span>');
+  if (vs.some(v => v.supports_tool_call)) caps.push('<span class="tag warn">工具</span>');
+  if (vs.some(v => v.supports_images)) caps.push('<span class="tag warn">视觉</span>');
+  const tip = vs[0].description ? ' title="' + esc(vs[0].description) + '"' : '';
+  // 最大输出列：与其它差异列同口径分行，并保留实测标注（逐域取各自 probe——probe 键
+  // 按带前缀 id 存）。钳制仍标 ⚠，避免汇聚后把风险标注吃掉。
+  const outVals = pick('max_output_tokens');
+  const outOne = v => {
+    const pr = probeOf(v.id);
+    if (pr && pr.verdict === 'clamped' && pr.measured) {
+      return '<span style="color:var(--warn);font-weight:600">' + fmtK(pr.measured) + ' ⚠</span>';
+    }
+    if (pr && pr.verdict === 'at_least' && pr.measured) {
+      return '<span style="color:var(--ink-3)">≥' + fmtK(pr.measured) + '</span>';
+    }
+    return v.max_output_tokens ? fmtK(v.max_output_tokens) : '—';
+  };
+  const outHtml = new Set(outVals.map(x => JSON.stringify(x.raw))).size <= 1
+    ? outOne(vs[0])
+    : '<div class="mv">' + vs.map(v => '<div class="mvr">' + outOne(v) +
+        '<i class="ms">' + esc(RLABEL[realmOf(v)] || realmOf(v)) + '</i></div>').join('') + '</div>';
+  return '<tr><td class="mark" aria-hidden="true"><i></i></td>' +
+    '<td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div>' +
+    '<div class="id">' + esc(vs[0].name || '') + '</div>' +
+    '<div class="id" style="margin-top:2px">' + badges + (caps.length ? ' ' + caps.join(' ') : '') + '</div></td>' +
+    '<td class="num">' + multiCell(pick('credits'), v => (v ? esc(v) : '—')) + '</td>' +
+    '<td>' + multiCell(pick('default_effort'), v => (v ? '<span class="tag ok">' + esc(v) + '</span>' : '<span style="color:var(--ink-3)">—</span>')) + '</td>' +
+    '<td class="efs" style="white-space:normal">' + multiCell(pick('supported_efforts'), effHtml) + '</td>' +
+    '<td class="num">' + multiCell(pick('context_length'), v => (v ? Math.round(v / 1000) + 'K' : '—')) + '</td>' +
+    '<td class="num">' + outHtml + '</td></tr>';
+}
+
 async function loadModels() {
   const tb = $('mdBody');
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
@@ -326,6 +387,7 @@ async function loadModels() {
     const probeKeys = Object.keys(probes);
     const probeOf = id => probes[id] || probes[probeKeys.find(k => k.endsWith(':' + id))];
     tb.innerHTML = list.map(m => {
+      if (m.merged) return mergedRow(m, probeOf);
       const eff = (m.supported_efforts || []).slice();
       if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
       const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
@@ -345,8 +407,11 @@ async function loadModels() {
         '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
         outCell(m, probeOf(m.id)) + '</tr>';
     }).join('');
-    const hit = list.filter(m => probeOf(m.id)).length;
-    $('mdNote').textContent = list.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
+    const hit = list.filter(m => m.merged
+      ? (m.variants || []).some(v => probeOf(v.id))
+      : probeOf(m.id)).length;
+    $('mdNote').textContent = list.length + ' 个模型 · ' + (d.merged ? '已汇聚两域同名 · ' : '') +
+      '已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
   } catch (e) {
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
   }
@@ -409,6 +474,9 @@ const CFG_MAP = {
   timeout_seconds: ['upstream', 'timeout_seconds'], header_timeout_seconds: ['upstream', 'header_timeout_seconds'],
   idle_timeout_seconds: ['upstream', 'idle_timeout_seconds'], user_agent: ['upstream', 'user_agent'],
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
+  prompt_text: ['prompt', 'text'],
+  panel_model_merge: ['panel', 'model_merge'],
+  cross_realm_models: ['routing', 'cross_realm_models'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
 };
@@ -435,6 +503,7 @@ async function loadConfig() {
     }
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
     $('cfgNote').textContent = '';
+    refreshPromptSource();
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
 }
 function collectConfig() {
@@ -447,7 +516,12 @@ function collectConfig() {
     else if (el.type === 'number') { v = el.value.trim() === '' ? undefined : Number(el.value); }
     else {
       const raw = el.value.trim();
-      if (raw === '') v = undefined;
+      if (name.endsWith('_models')) {
+        // 字符串列表（逗号/空格分隔）。**清空即清空列表**——与其它字段"空 = 沿用现值"
+        // 的约定不同：列表没有"未设置"与"空列表"的区分，沿用语义会让用户删不掉最后一项。
+        v = raw === '' ? [] : raw.split(/[,，\s]+/).filter(Boolean);
+      }
+      else if (raw === '') v = undefined;
       else if (name.endsWith('_hours')) v = raw.split(/[,，\s]+/).filter(Boolean).map(Number);
       else v = raw;
     }
@@ -487,6 +561,31 @@ $('btnEye').onclick = () => {
   el.type = show ? 'text' : 'password';
   $('btnEye').textContent = show ? '隐藏' : '显示';
 };
+/* 当前生效的系统提示词来源：面板只有文件路径一个输入框时看不到实际注入内容，
+   这里把"网关此刻到底注入什么、从哪来"直接显示出来，并支撑「载入当前生效」。 */
+const PROMPT_SRC = { inline: '面板内容框', file: '提示词文件', builtin: '内置默认', none: '不注入' };
+async function refreshPromptSource() {
+  const el = $('promptSource');
+  if (!el) return;
+  try {
+    const d = await api('prompt');
+    el.textContent = d.injected
+      ? '当前生效：' + d.mode + ' 模式，注入「' + (PROMPT_SRC[d.source] || d.source) +
+        '」，共 ' + (d.text || '').length + ' 字符'
+      : '当前不注入提示词（' + d.mode + ' 模式：透传客户端原始 system）';
+  } catch (e) {
+    el.textContent = '';
+  }
+}
+$('btnLoadPrompt').onclick = async () => {
+  try {
+    const d = await api('prompt');
+    if (!d.injected) { toast('当前模式不注入提示词，无可载入内容', 'err'); return; }
+    $('cfgForm').elements['prompt_text'].value = d.text;
+    toast('已载入当前生效提示词，修改后点「保存配置」', 'ok');
+    refreshPromptSource();
+  } catch (e) { toast('载入失败：' + e.message, 'err'); }
+};
 $('btnCfgReload').onclick = loadConfig;
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();
@@ -517,20 +616,28 @@ $('cfgForm').onsubmit = async ev => {
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
 function openAdd() {
   $('addVeil').classList.add('on');
-  // 重置到登录标签
-  switchAddTab('login');
+  // 先重置各标签的瞬态显示，再切标签——switchAddTab 据此同步页脚按钮
   $('addPick').hidden = false;
   $('addLoad').hidden = true; $('addReady').hidden = true;
   $('addDone').hidden = true; $('addErr').hidden = true;
   $('importDone').hidden = true; $('importErr').hidden = true;
-  $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
-  $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
+  $('authsDone').hidden = true; $('authsErr').hidden = true;
+  $('btnStartLogin').disabled = false;
+  switchAddTab('login');
   stopPoll();
 }
 function switchAddTab(tab) {
   document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
   $('addTabLogin').hidden = tab !== 'login';
   $('addTabImport').hidden = tab !== 'import';
+  $('addTabAuths').hidden = tab !== 'auths';
+  // 页脚按钮跟随登录流程阶段：导入标签下全部隐藏，登录标签按当前阶段显示
+  const login = tab === 'login';
+  const picking = login && $('addReady').hidden && $('addDone').hidden;
+  const ready = login && !$('addReady').hidden;
+  $('btnStartLogin').hidden = !picking;
+  $('btnCopyUrl').hidden = !ready;
+  $('btnOpenUrl').hidden = !ready;
 }
 document.querySelectorAll('#addTabs .tab').forEach(b => {
   b.onclick = () => switchAddTab(b.dataset.tab);
@@ -603,6 +710,40 @@ $('importFile').onchange = async () => {
     $('importErr').textContent = '导入失败：' + e.message;
   }
   $('importFile').value = '';
+};
+/* 导入本地部署 auths/*.json：多选文件或整个目录，后端自动识别嵌套形/扁平形 */
+async function importAuths(files) {
+  if (!files || !files.length) return;
+  $('authsDone').hidden = true; $('authsErr').hidden = true;
+  const fd = new FormData();
+  for (const f of files) fd.append('files', f);
+  const h = {};
+  const k = localStorage.getItem(LS_KEY);
+  if (k) h['Authorization'] = 'Bearer ' + k;
+  try {
+    const r = await fetch('/panel/api/import/auths', { method: 'POST', body: fd, headers: h });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    $('authsDone').hidden = false;
+    $('authsDone').textContent = '导入完成：成功 ' + d.imported + ' 个' +
+      (d.skipped ? '，跳过 ' + d.skipped + ' 个' : '') + '（共 ' + d.files + ' 个文件）';
+    if (d.errors && d.errors.length) console.warn('import errors:', d.errors);
+    loadOverview(true);
+  } catch (e) {
+    $('authsErr').hidden = false;
+    $('authsErr').textContent = '导入失败：' + e.message;
+  }
+}
+// 先取快照再清空 input.value：FileList 是活引用，清空后会被一并清掉
+$('authsFiles').onchange = () => {
+  const fs = Array.from($('authsFiles').files);
+  $('authsFiles').value = '';
+  importAuths(fs);
+};
+$('authsDir').onchange = () => {
+  const fs = Array.from($('authsDir').files);
+  $('authsDir').value = '';
+  importAuths(fs);
 };
 
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */

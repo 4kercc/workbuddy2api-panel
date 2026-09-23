@@ -191,7 +191,7 @@ func TestRewriteEmptyPromptReturnedAsIs(t *testing.T) {
 }
 
 func TestLoadDefaultWhenFileEmpty(t *testing.T) {
-	got, err := Load("custom", "")
+	got, src, err := Load("custom", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,6 +201,9 @@ func TestLoadDefaultWhenFileEmpty(t *testing.T) {
 	if len(got) == 0 {
 		t.Error("default prompt is empty")
 	}
+	if src != SourceBuiltin {
+		t.Errorf("source=%q want %q", src, SourceBuiltin)
+	}
 }
 
 func TestLoadFileOverride(t *testing.T) {
@@ -208,17 +211,63 @@ func TestLoadFileOverride(t *testing.T) {
 	fp := filepath.Join(dir, "my.md")
 	want := "这是我的自定义人格入口。"
 	os.WriteFile(fp, []byte(want), 0o600)
-	got, err := Load("custom", fp)
+	got, src, err := Load("custom", fp, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != want {
 		t.Errorf("Load()=%q want %q", got, want)
 	}
+	if src != SourceFile {
+		t.Errorf("source=%q want %q", src, SourceFile)
+	}
 }
 
 func TestLoadFileMissingFailsFast(t *testing.T) {
-	if _, err := Load("custom", "/nonexistent/promp.md"); err == nil {
+	if _, _, err := Load("custom", "/nonexistent/promp.md", ""); err == nil {
 		t.Fatal("missing file should return error (fail fast)")
+	}
+}
+
+// TestLoadInlineBeatsFile 内联内容优先于文件：面板里改了提示词，不该被同存的
+// file 配置盖掉（否则用户以为改了、实际没改）。
+func TestLoadInlineBeatsFile(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "my.md")
+	os.WriteFile(fp, []byte("文件里的旧人格"), 0o600)
+	inline := "面板里新写的人格"
+
+	got, src, err := Load("custom", fp, inline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != inline {
+		t.Errorf("Load()=%q want inline %q", got, inline)
+	}
+	if src != SourceInline {
+		t.Errorf("source=%q want %q", src, SourceInline)
+	}
+}
+
+// TestLoadInlineBeatsBuiltin 内联内容非空时不再回落内置默认。
+func TestLoadInlineBeatsBuiltin(t *testing.T) {
+	got, src, err := Load("append", "", "只此一句")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "只此一句" || src != SourceInline {
+		t.Errorf("got (%q,%q) want (\"只此一句\",%q)", got, src, SourceInline)
+	}
+}
+
+// TestLoadBlankInlineFallsThrough 全空白的内联内容视为未填（走文件/内置），
+// 避免"内容框里留了几个空格"把提示词变成空串从而静默关闭注入。
+func TestLoadBlankInlineFallsThrough(t *testing.T) {
+	got, src, err := Load("custom", "", "   \n\t ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != defaultPrompt || src != SourceBuiltin {
+		t.Errorf("got (%d chars,%q) want (builtin default,%q)", len(got), src, SourceBuiltin)
 	}
 }
