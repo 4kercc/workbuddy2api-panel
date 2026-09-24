@@ -31,9 +31,12 @@ PLAN.md
 SPEC.md
 docs/
 
-# 设计/计划文档（但 README.md 必须进版本库）
+# 设计/计划文档（但 README.md 与 project.md 必须进版本库）
+# project.md = 本 fork 各项改动的背景、设计取舍与验证记录，随代码一起公开，
+# 便于 review 时理解「为什么这么改」。
 *.md
 !README.md
+!project.md
 
 # Windows binaries
 /wb2api.exe
