@@ -144,7 +144,9 @@ body {
 .topbar .sep { color: var(--ink-3); }
 .topbar .meta { color: var(--ink-3); font-size: 12px; font-family: var(--mono); }
 .topbar .grow { flex: 1; }
-.view { padding: 22px 24px 60px; max-width: 1180px; width: 100%; }
+/* 内容区铺满可用宽度。原先 max-width:1180px 在 1080p（侧栏 208 + 两侧 padding 48）
+   下会空出近 500px；面板以数据表格为主，宽度越大越好用，故不设上限。 */
+.view { padding: 22px 24px 60px; width: 100%; }
 .view[hidden] { display: none; }
 
 /* ── 控件 ─────────────────────────────────────────────────────────── */
