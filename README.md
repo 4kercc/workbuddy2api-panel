@@ -20,7 +20,7 @@
 
 > **本仓库是 [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) 的 fork**，
 > 后者是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的增强分支。
-> 本 fork 在上游基础上新增四项能力（详见 [本 fork 的增量](#-本-fork-的增量)）：
+> 本 fork 在上游基础上新增五项能力（详见 [本 fork 的增量](#-本-fork-的增量)）：
 > **本地部署账号导入**、**系统提示词面板化（热生效）**、**两域模型汇聚**、**跨域模型路由**。
 > 上游设计的精巧之处（账号池调度、错误分类、提示词体系）原样保留，其相对 Sliverkiss 原版的差异见 [与上游的差异](#-与上游的差异)。
 
@@ -128,7 +128,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 ## 🆕 本 fork 的增量
 
-本仓库（`4kercc/workbuddy2api-panel`）在 [上游 linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) 基础上新增以下四项，均含单元测试；**默认行为不变**（跨域白名单为空 + 汇聚关闭 + `prompt.mode=passthrough` 时与上游完全一致）。
+本仓库（`4kercc/workbuddy2api-panel`）在 [上游 linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) 基础上新增以下五项，均含单元测试；**默认行为不变**（跨域白名单为空 + 汇聚关闭 + `prompt.mode=passthrough` 时与上游完全一致）。
 
 | 能力 | 说明 |
 |---|---|
@@ -136,6 +136,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **系统提示词面板化 + 修热生效静默失效** | 新增 `prompt.text` 内联内容（优先级 **text > file > 内置默认**），面板「配置」页可直接编辑提示词正文；新增 `GET /panel/api/prompt` 返回当前生效文本与来源（`inline` / `file` / `builtin`），并提供「载入当前生效」一键填入内置默认后再改写。**修复**：`PromptMode` / `PromptText` 此前是 handler 启动期静态字段，既不在 `livecfg` 快照、也没被 `saveConfig` 应用，而 `restartRequiredFields` 又未列 `prompt` —— 面板改提示词报「已保存并立即生效」，实际不生效且不提示重启。现收编进 `livecfg` 快照，**保存即热生效** |
 | **两域模型汇聚** | `panel.model_merge` 开启后「模型与档位」把 CN / global 同名模型合并为一行，仅单域存在的保持独立。实测 9 个同名模型中 7 个两域元数据不同（积分倍率 / 最大输出 / 思考档位 / 能力旗标），故**差异字段两域分行并排保留**而非取其一，避免按错误的上限与成本预期使用模型。**仅作用于面板展示**：`/v1/models` 的带前缀命名与选号路由不变（前缀即路由信号，汇聚掉会让 global 独有模型被静默路由到 CN 账号） |
 | **跨域模型路由** | `routing.cross_realm_models` 列出**裸模型名**后，该模型的请求不做选号域过滤，CN 与 global 账号同为候选，同一模型名可跨两域使用（如 `deepseek-v4.1-flash` 两域都有）。显式 `cn:` / `global:` 前缀仍强制锁域。新增 `ResolveRoute` 作为唯一入口，chat 主链路与会话粘性可用集共用同一口径（否则粘性命中会绕过白名单）。`realm==""` 在池内本就表示「不过滤」，故未触碰选号算法 |
+| **账号信息脱敏开关** | 账号池右上角「隐藏账号信息」一键把昵称与 uid 换成 `••••••`，并摘掉行上的 uid tooltip —— 截图 / 分享面板时不暴露账号身份。纯前端显示层：操作按钮仍用真实 uid，功能不受影响；域徽标保留。状态存 localStorage，刷新后保持 |
 
 用法：
 
