@@ -21,12 +21,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+	"github.com/4kercc/workbuddy2api-panel/internal/httpauth"
+	"github.com/4kercc/workbuddy2api-panel/internal/livecfg"
+	"github.com/4kercc/workbuddy2api-panel/internal/pool"
+	"github.com/4kercc/workbuddy2api-panel/internal/scheduler"
+	"github.com/4kercc/workbuddy2api-panel/internal/upstream"
+	"github.com/4kercc/workbuddy2api-panel/internal/usage"
 )
 
 // Config 面板依赖（main 装配注入）。

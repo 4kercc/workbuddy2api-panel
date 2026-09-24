@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/4kercc/workbuddy2api-panel/internal/auth"
 )
 
 func TestClassify(t *testing.T) {

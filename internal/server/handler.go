@@ -13,15 +13,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+	"github.com/4kercc/workbuddy2api-panel/internal/auth"
+	"github.com/4kercc/workbuddy2api-panel/internal/httpauth"
+	"github.com/4kercc/workbuddy2api-panel/internal/livecfg"
+	"github.com/4kercc/workbuddy2api-panel/internal/logfmt"
+	"github.com/4kercc/workbuddy2api-panel/internal/pool"
+	"github.com/4kercc/workbuddy2api-panel/internal/prompt"
+	"github.com/4kercc/workbuddy2api-panel/internal/session"
+	"github.com/4kercc/workbuddy2api-panel/internal/upstream"
+	"github.com/4kercc/workbuddy2api-panel/internal/usage"
 )
 
 // Config handler 依赖。

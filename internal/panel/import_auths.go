@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"path/filepath"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/4kercc/workbuddy2api-panel/internal/auth"
 )
 
 // importAuths 导入本地部署（Windows / macOS / Linux 版）auths 目录下的凭证文件。

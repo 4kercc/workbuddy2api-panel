@@ -3,7 +3,7 @@ package server
 import (
 	"testing"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/4kercc/workbuddy2api-panel/internal/livecfg"
 )
 
 // TestPromptCfgPrefersLive 面板改提示词必须立即生效：promptCfg 优先读 Live 快照。

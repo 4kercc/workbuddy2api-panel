@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/4kercc/workbuddy2api-panel/internal/logfmt"
+	"github.com/4kercc/workbuddy2api-panel/internal/pool"
 )
 
 // chatSeq 进程级请求序号。

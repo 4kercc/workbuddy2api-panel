@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/4kercc/workbuddy2api-panel/internal/prompt"
 )
 
 // Config 顶层配置。

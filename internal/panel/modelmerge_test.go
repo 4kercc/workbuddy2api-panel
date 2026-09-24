@@ -3,7 +3,7 @@ package panel
 import (
 	"testing"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/4kercc/workbuddy2api-panel/internal/livecfg"
 )
 
 // me 构造一个模型条目（测试用最小形状）。

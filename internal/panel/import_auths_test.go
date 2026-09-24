@@ -10,8 +10,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/4kercc/workbuddy2api-panel/internal/auth"
+	"github.com/4kercc/workbuddy2api-panel/internal/pool"
 )
 
 // testPanelWithPool 建一个带真实 Pool 的面板（Upstream 留 nil → 签到等附属动作跳过，

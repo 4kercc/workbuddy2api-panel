@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/4kercc/workbuddy2api-panel/internal/auth"
 )
 
 // degradeReason 连败降权（issue #114）写 reason 的固定文案：与冷却域的
