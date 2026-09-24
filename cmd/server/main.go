@@ -30,9 +30,9 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-// 本 fork 自 1.11.2-panel 起叠加四项能力（本地部署导入 / 提示词面板化 + 热生效 /
-// 两域模型汇聚 / 跨域模型路由），故提到 1.12.0-panel —— 与上游同号会让 issue 定位串味。
-const appVersion = "1.12.0-panel"
+// 本 fork 自 1.11.2-panel 起叠加能力（本地部署导入 / 提示词面板化 + 热生效 /
+// 两域模型汇聚 / 跨域模型路由 / 账号信息脱敏），故与上游 1.11.2 区分。
+const appVersion = "1.12.1-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
