@@ -18,9 +18,11 @@
 
 ---
 
-> **本项目是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的增强分支**（fork）。
-> 在上游基础上重构了可视化运维层，并同步了上游全部功能更新。
-> 差异概览见 [与上游的差异](#-与上游的差异)；上游设计的精巧之处（账号池调度、错误分类、提示词体系）原样保留，详见下文与上游 README。
+> **本仓库是 [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) 的 fork**，
+> 后者是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的增强分支。
+> 本 fork 在上游基础上新增四项能力（详见 [本 fork 的增量](#-本-fork-的增量)）：
+> **本地部署账号导入**、**系统提示词面板化（热生效）**、**两域模型汇聚**、**跨域模型路由**。
+> 上游设计的精巧之处（账号池调度、错误分类、提示词体系）原样保留，其相对 Sliverkiss 原版的差异见 [与上游的差异](#-与上游的差异)。
 
 ## 项目简介
 
@@ -124,9 +126,33 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 成长中心连登档位（连续登录 7/14/28 天）兑换后发放积分 / 能量 / 补签卡 / **抽奖次数**，抽奖次数只能从兑换获得。网关把它挂在每日签到排程末尾自动跑闭环（见[定时任务](#定时任务)）：档位解锁当天自动兑换、有抽奖次数自动抽完，全程无需人工盯。
 
+## 🆕 本 fork 的增量
+
+本仓库（`4kercc/workbuddy2api-panel`）在 [上游 linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) 基础上新增以下四项，均含单元测试；**默认行为不变**（跨域白名单为空 + 汇聚关闭 + `prompt.mode=passthrough` 时与上游完全一致）。
+
+| 能力 | 说明 |
+|---|---|
+| **本地部署账号导入** | `POST /panel/api/import/auths`。把本地 exe 版 `auths/` 目录下的凭证直接搬到服务器，免重走 OAuth。自动识别嵌套形 / 扁平形 / 数组三种内容形态（复用 `auth.Parse`）；uid 白名单拦路径穿越；目录里混入的 `state.json` / `usage.json` 静默跳过。面板「添加账号」新增第三个标签页，支持多选凭证文件或直接选整个 `auths` 文件夹 |
+| **系统提示词面板化 + 修热生效静默失效** | 新增 `prompt.text` 内联内容（优先级 **text > file > 内置默认**），面板「配置」页可直接编辑提示词正文；新增 `GET /panel/api/prompt` 返回当前生效文本与来源（`inline` / `file` / `builtin`），并提供「载入当前生效」一键填入内置默认后再改写。**修复**：`PromptMode` / `PromptText` 此前是 handler 启动期静态字段，既不在 `livecfg` 快照、也没被 `saveConfig` 应用，而 `restartRequiredFields` 又未列 `prompt` —— 面板改提示词报「已保存并立即生效」，实际不生效且不提示重启。现收编进 `livecfg` 快照，**保存即热生效** |
+| **两域模型汇聚** | `panel.model_merge` 开启后「模型与档位」把 CN / global 同名模型合并为一行，仅单域存在的保持独立。实测 9 个同名模型中 7 个两域元数据不同（积分倍率 / 最大输出 / 思考档位 / 能力旗标），故**差异字段两域分行并排保留**而非取其一，避免按错误的上限与成本预期使用模型。**仅作用于面板展示**：`/v1/models` 的带前缀命名与选号路由不变（前缀即路由信号，汇聚掉会让 global 独有模型被静默路由到 CN 账号） |
+| **跨域模型路由** | `routing.cross_realm_models` 列出**裸模型名**后，该模型的请求不做选号域过滤，CN 与 global 账号同为候选，同一模型名可跨两域使用（如 `deepseek-v4.1-flash` 两域都有）。显式 `cn:` / `global:` 前缀仍强制锁域。新增 `ResolveRoute` 作为唯一入口，chat 主链路与会话粘性可用集共用同一口径（否则粘性命中会绕过白名单）。`realm==""` 在池内本就表示「不过滤」，故未触碰选号算法 |
+
+用法：
+
+```bash
+# 跨域模型路由：让 deepseek-v4.1-flash 在两个域的账号间选号
+# 面板「配置」页填写，或直接改 config.json（保存后热生效，无需重启）
+{
+  "routing": { "cross_realm_models": ["deepseek-v4.1-flash"] },
+  "panel":   { "model_merge": true }
+}
+```
+
+> 跨域的前提：该模型在两域上游都真实存在。只存在于单域的模型写进来后，被选到另一域账号会打上游不存在的模型而失败（配置期无法校验，属配置方责任）。
+
 ## 🆚 与上游的差异
 
-本分支相对 [上游 master](https://github.com/Sliverkiss/workbuddy2api) 的增量（均已在真实多账号环境验证）：
+以下为 [上游 linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) 相对 [Sliverkiss 原版](https://github.com/Sliverkiss/workbuddy2api) 的增量（均已在真实多账号环境验证）——本 fork 完整继承：
 
 ### 新增
 
@@ -206,7 +232,7 @@ flowchart LR
 
 ```bash
 # 1. 克隆
-git clone https://github.com/linguo2625469/workbuddy2api-panel.git
+git clone https://github.com/4kercc/workbuddy2api-panel.git
 cd workbuddy2api-panel
 
 # 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
