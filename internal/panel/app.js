@@ -137,7 +137,7 @@ function go(v) {
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
-  if (v === 'taskscenter') { loadSchoolStatus(true); pollQueueOnce(); }
+  if (v === 'taskscenter') { loadSchoolStatus(true); pollQueueOnce(); loadAutoTasks(); syncQueuePolling(); }
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
 go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accounts').slice(1) : 'accounts');
@@ -488,6 +488,8 @@ const CFG_MAP = {
   activity_hours: ['schedule', 'activity_hours'], activity_enabled: ['schedule', 'activity_enabled'],
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
+  task_auto_enabled: ['schedule', 'task_auto_enabled'], task_auto_hours: ['schedule', 'task_auto_hours'],
+  task_auto_concurrency: ['schedule', 'task_auto_concurrency'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   breaker_threshold: ['pool', 'breaker_threshold'],
   degrade_threshold: ['pool', 'degrade_threshold'], degrade_cooldown: ['pool', 'degrade_cooldown'],
@@ -1284,6 +1286,47 @@ $('btnVcRefresh').onclick = loadSchoolVouchers;
    队列状态覆盖。 */
 let queueTimer = null, lastQueueSeq = 0;
 const GROWTH_TITLES = {}; // code → 展示名（扫描时从任务列表带出）
+
+/* 自动扫描 + 执行：开关直接落到 config 的 schedule.task_auto_enabled（保存即热
+   生效——scheduler 重排 + 面板快照同步）。刻意不另存一份面板状态：两处各存一份
+   迟早漂移成"面板说开着、配置里是关的"。 */
+function fmtAutoAt(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '—';
+  const p = n => String(n).padStart(2, '0');
+  return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+async function loadAutoTasks() {
+  const box = $('qcAutoNote');
+  if (!box) return;
+  try {
+    const d = await api('tasks/auto');
+    $('qcAuto').checked = !!d.enabled;
+    const parts = [];
+    if (d.enabled) {
+      parts.push('下次 ' + fmtAutoAt(d.next_at));
+      if ((d.hours || []).length) parts.push('时点 ' + d.hours.join('/') + ' 点');
+      parts.push('并发 ' + (d.concurrency || 1));
+    } else parts.push('自动执行已关闭');
+    if (d.last_run) parts.push('上次 ' + fmtAutoAt(d.last_run) + (d.last_result ? '（' + d.last_result + '）' : ''));
+    box.textContent = parts.join(' · ');
+  } catch (e) { box.textContent = ''; }
+}
+$('qcAuto').onchange = async () => {
+  const el = $('qcAuto'), on = el.checked;
+  el.disabled = true;
+  try {
+    await api('config', { method: 'POST', body: JSON.stringify({ schedule: { task_auto_enabled: on } }) });
+    toast(on ? '已开启：按配置时点自动扫描待办并执行' : '已关闭自动执行', 'ok');
+    loadConfig();    // 配置页表单同步（含时点/并发回显）
+    loadAutoTasks();
+  } catch (e) {
+    el.checked = !on;
+    toast('设置失败：' + e.message, 'err');
+  } finally { el.disabled = false; }
+};
+
 $('btnScanAll').onclick = async () => {
   const b = $('btnScanAll');
   b.disabled = true; b.textContent = '扫描中…';
@@ -1389,6 +1432,14 @@ async function pollQueueOnce() {
     renderQueue(groupsFromQueue(q.items || []), q);
   } catch (e) { /* 静默 */ }
 }
+/* 进入任务中心时对齐轮询：队列在跑就接管进度显示——后端「自动执行」启动的轮次
+   本页没启动过（lastQueueSeq=0），同样要能看到实时进度而不是停在旧列表上。 */
+async function syncQueuePolling() {
+  try {
+    const q = await api('tasks/queue');
+    if (q.running) startQueuePolling();
+  } catch (e) { /* 静默 */ }
+}
 function startQueuePolling() {
   if (queueTimer) clearInterval(queueTimer);
   queueTimer = setInterval(async () => {
@@ -1399,6 +1450,7 @@ function startQueuePolling() {
         clearInterval(queueTimer); queueTimer = null;
         toast('任务队列执行结束', 'ok');
         loadSchoolStatus(true);
+        loadAutoTasks(); // 自动轮次结束后刷新"上次结果/下次时点"
       }
     } catch (e) { /* 忽略 */ }
   }, 3000);

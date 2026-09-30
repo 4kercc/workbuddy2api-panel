@@ -569,6 +569,101 @@ func TestBalanceRefreshDefaults(t *testing.T) {
 	}
 }
 
+// TestTaskAutoDefaults 任务队列自动扫描+执行：时点/并发有默认值，但开关缺省关闭
+// （与签到等五项「缺省 true」刻意相反——队列含真实对话任务，升级不得无声开跑）。
+func TestTaskAutoDefaults(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Schedule.TaskAutoEnabled {
+		t.Error("task_auto_enabled must default to false (队列含真实对话，需显式开启)")
+	}
+	if len(c.Schedule.TaskAutoHours) != 2 || c.Schedule.TaskAutoHours[0] != 10 || c.Schedule.TaskAutoHours[1] != 20 {
+		t.Errorf("task_auto_hours=%v want default [10 20]", c.Schedule.TaskAutoHours)
+	}
+	if c.Schedule.TaskAutoConcurrency != 1 {
+		t.Errorf("task_auto_concurrency=%d want 1", c.Schedule.TaskAutoConcurrency)
+	}
+}
+
+// TestTaskAutoLegacyConfigStaysOff 老 config（无该键）加载后自动执行仍是关闭态：
+// 升级行为零突变，用户显式开启才跑。
+func TestTaskAutoLegacyConfigStaysOff(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"schedule":{"checkin_hours":[9,21]}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Schedule.TaskAutoEnabled {
+		t.Error("legacy config must keep task_auto disabled")
+	}
+	if len(c.Schedule.TaskAutoHours) != 2 {
+		t.Errorf("task_auto_hours=%v want default [10 20]", c.Schedule.TaskAutoHours)
+	}
+}
+
+// TestTaskAutoExplicitEnable 显式开启并自定义时点/并发。
+func TestTaskAutoExplicitEnable(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"schedule":{"task_auto_enabled":true,"task_auto_hours":[8,12,22],"task_auto_concurrency":3}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Schedule.TaskAutoEnabled {
+		t.Error("task_auto_enabled=true 未生效")
+	}
+	if len(c.Schedule.TaskAutoHours) != 3 || c.Schedule.TaskAutoHours[0] != 8 || c.Schedule.TaskAutoHours[2] != 22 {
+		t.Errorf("task_auto_hours=%v want [8 12 22]", c.Schedule.TaskAutoHours)
+	}
+	if c.Schedule.TaskAutoConcurrency != 3 {
+		t.Errorf("task_auto_concurrency=%d want 3", c.Schedule.TaskAutoConcurrency)
+	}
+}
+
+// TestTaskAutoHoursAndConcurrencyNormalized 空时点回落默认；并发越界回落 1
+// （与面板执行队列的 1-4 上限同口径）。
+func TestTaskAutoHoursAndConcurrencyNormalized(t *testing.T) {
+	cases := []string{
+		`{"schedule":{"task_auto_hours":[],"task_auto_concurrency":0}}`,
+		`{"schedule":{"task_auto_hours":null,"task_auto_concurrency":9}}`,
+		`{"schedule":{"task_auto_concurrency":-3}}`,
+	}
+	for _, body := range cases {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "c.json")
+		os.WriteFile(fp, []byte(body), 0o600)
+		c, err := Load(fp)
+		if err != nil {
+			t.Fatalf("%s: %v", body, err)
+		}
+		if len(c.Schedule.TaskAutoHours) != 2 || c.Schedule.TaskAutoHours[0] != 10 {
+			t.Errorf("%s: task_auto_hours=%v want default [10 20]", body, c.Schedule.TaskAutoHours)
+		}
+		if c.Schedule.TaskAutoConcurrency != 1 {
+			t.Errorf("%s: task_auto_concurrency=%d want 1", body, c.Schedule.TaskAutoConcurrency)
+		}
+	}
+}
+
+// TestTaskAutoInvalidHourRejected 非法小时快速失败，错误信息指向正确的开关名。
+func TestTaskAutoInvalidHourRejected(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"schedule":{"task_auto_hours":[24]}}`), 0o600)
+	_, err := Load(fp)
+	if err == nil {
+		t.Fatal("want error for task_auto_hours:[24]")
+	}
+	if !strings.Contains(err.Error(), "task_auto_enabled") {
+		t.Errorf("error should point at schedule.task_auto_enabled: %v", err)
+	}
+}
+
 // TestPromptDefaultPassthrough 默认 prompt.mode=passthrough（对齐上游：透传客户端
 // 原始 system 是更保守的缺省）；custom 由用户显式选择，此时 PromptText 为内置默认（非空）。
 func TestPromptDefaultPassthrough(t *testing.T) {

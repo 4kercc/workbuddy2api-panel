@@ -180,6 +180,61 @@ func TestRunAllDisabledNoSpinNoCalls(t *testing.T) {
 	}
 }
 
+// TestNextWakeTaskAuto 任务队列自动执行排程：回调未装配（nil）时不进排程
+// （老调用方/零值 Config 行为不变）；装配且未禁用时按时点唤醒；热改立即生效。
+func TestNextWakeTaskAuto(t *testing.T) {
+	allOff := Config{
+		CheckinDisabled: true, TravelDisabled: true, ActivityDisabled: true,
+		KeepaliveDisabled: true, BlackcatDisabled: true,
+	}
+	s := New(Config{
+		CheckinDisabled: true, TravelDisabled: true, ActivityDisabled: true,
+		KeepaliveDisabled: true, BlackcatDisabled: true,
+		TaskAutoHours: []int{10, 20}, TaskAutoFn: func() {},
+	})
+	at, kinds := s.nextWake(time.Date(2026, 9, 11, 12, 0, 0, 0, time.Local))
+	if want := time.Date(2026, 9, 11, 20, 0, 0, 0, time.Local); !at.Equal(want) {
+		t.Errorf("next=%v want %v", at, want)
+	}
+	if len(kinds) != 1 || kinds[0] != taskTaskAuto {
+		t.Errorf("kinds=%v want [taskAuto]", kinds)
+	}
+
+	// 未装配回调：不进排程（面板未接入时零影响）。
+	noFn := allOff
+	noFn.TaskAutoHours = []int{10, 20}
+	if at, kinds := New(noFn).nextWake(time.Now()); !at.IsZero() || len(kinds) != 0 {
+		t.Errorf("nil 回调不应进排程：at=%v kinds=%v", at, kinds)
+	}
+
+	// 热改：禁用后立刻从排程消失；再启用并改时点后按新时点算。
+	s.ReconfigureTaskAuto([]int{6}, true)
+	if at, kinds := s.nextWake(time.Now()); !at.IsZero() || len(kinds) != 0 {
+		t.Errorf("禁用后不应有时点：at=%v kinds=%v", at, kinds)
+	}
+	s.ReconfigureTaskAuto([]int{7}, false)
+	if next := s.NextTaskAutoAt(time.Date(2026, 9, 11, 12, 0, 0, 0, time.Local)); next.Hour() != 7 || next.Day() != 12 {
+		t.Errorf("NextTaskAutoAt=%v want 次日 07:00", next)
+	}
+	// 禁用态下 NextTaskAutoAt 返回零值（面板据此不显示"下次执行"）。
+	s.ReconfigureTaskAuto([]int{7}, true)
+	if next := s.NextTaskAutoAt(time.Now()); !next.IsZero() {
+		t.Errorf("禁用态 NextTaskAutoAt=%v want zero", next)
+	}
+}
+
+// TestRunBatchTaskAutoInvokesCallback 到点触发注入回调（回调契约是自行异步，
+// 这里只验证被调用一次、且未装配时静默不 panic）。
+func TestRunBatchTaskAutoInvokesCallback(t *testing.T) {
+	var calls atomic.Int32
+	s := New(Config{TaskAutoFn: func() { calls.Add(1) }})
+	s.runBatch(context.Background(), []taskKind{taskTaskAuto})
+	if calls.Load() != 1 {
+		t.Errorf("calls=%d want 1", calls.Load())
+	}
+	New(Config{}).runBatch(context.Background(), []taskKind{taskTaskAuto}) // 未装配：静默跳过
+}
+
 func hasKind(kinds []taskKind, k taskKind) bool {
 	for _, v := range kinds {
 		if v == k {

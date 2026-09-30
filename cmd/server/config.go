@@ -38,6 +38,9 @@ type Config struct {
 		ActivityHours  []int `json:"activity_hours"`  // [10]
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]
 		BlackcatHours  []int `json:"blackcat_hours"`  // [23] 夜猫子窗口（23:00–08:00 计数）
+		// TaskAutoHours 任务队列自动扫描 + 自动执行的时点（小时）。成长任务/开学季
+		// 每日刷新，默认早晚各扫一次：上午做掉当天新任务，晚间补做+补领奖。
+		TaskAutoHours []int `json:"task_auto_hours"` // [10, 20]
 		// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/BlackcatEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
@@ -52,6 +55,15 @@ type Config struct {
 		ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 停活跃上报
 		KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
 		BlackcatEnabled  bool `json:"blackcat_enabled"`  // 缺省 true；false = 关夜猫子
+
+		// TaskAutoEnabled 任务队列自动扫描 + 自动执行开关。
+		//
+		// **缺省 false（与上面五个开关刻意相反）**：队列里的任务动作含真实对话
+		// （expert 系每账号每轮 8 次），升级即自动开跑等于未经同意消耗配额。
+		// 想自动的用户在面板「任务中心」点一下开关即开，或在此写 true。
+		TaskAutoEnabled bool `json:"task_auto_enabled"` // 缺省 false；true = 到点自动扫描并执行待办
+		// TaskAutoConcurrency 自动执行的账号间并发（账号内恒串行），1-4，缺省 1。
+		TaskAutoConcurrency int `json:"task_auto_concurrency"` // 缺省 1；越界回落 1
 
 		// 余额后台周期刷新：两次签到时点之间 credits 也能保持新鲜（面板/状态观测用）。
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
@@ -216,6 +228,9 @@ func Default() *Config {
 	c.Schedule.ActivityHours = []int{10}
 	c.Schedule.KeepaliveHours = []int{22}
 	c.Schedule.BlackcatHours = []int{23}
+	// 任务队列自动扫描+执行：时点默认早晚各一次；开关缺省 false（见字段注释）。
+	c.Schedule.TaskAutoHours = []int{10, 20}
+	c.Schedule.TaskAutoConcurrency = 1
 	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
 	// 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
 	c.Schedule.CheckinEnabled = true
@@ -511,6 +526,14 @@ func (c *Config) normalize() error {
 	if len(c.Schedule.BlackcatHours) == 0 {
 		c.Schedule.BlackcatHours = []int{23}
 	}
+	// 任务队列自动扫描+执行：空时点回落默认 [10,20]（与其它排程同口径：空=未配置）；
+	// 并发钳到 1-4（与面板执行队列的并发上限一致，0/负数回落 1）。
+	if len(c.Schedule.TaskAutoHours) == 0 {
+		c.Schedule.TaskAutoHours = []int{10, 20}
+	}
+	if c.Schedule.TaskAutoConcurrency < 1 || c.Schedule.TaskAutoConcurrency > 4 {
+		c.Schedule.TaskAutoConcurrency = 1
+	}
 	// 余额后台刷新：启用时 minutes<=0 回落默认 5；关闭时 interval 保持 0（不启动）。
 	if c.Schedule.BalanceRefreshEnabled {
 		if c.Schedule.BalanceRefreshMinutes <= 0 {
@@ -600,7 +623,10 @@ func (c *Config) validateScheduleHours() error {
 	if err := checkHourRange("schedule.keepalive_hours", "keepalive_enabled", c.Schedule.KeepaliveHours); err != nil {
 		return err
 	}
-	return checkHourRange("schedule.blackcat_hours", "blackcat_enabled", c.Schedule.BlackcatHours)
+	if err := checkHourRange("schedule.blackcat_hours", "blackcat_enabled", c.Schedule.BlackcatHours); err != nil {
+		return err
+	}
+	return checkHourRange("schedule.task_auto_hours", "task_auto_enabled", c.Schedule.TaskAutoHours)
 }
 
 func checkHourRange(field, switchKey string, hours []int) error {

@@ -31,8 +31,9 @@ import (
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
 // 本 fork 自 1.11.2-panel 起叠加能力（本地部署导入 / 提示词面板化 + 热生效 /
-// 两域模型汇聚 / 跨域模型路由 / 账号信息脱敏），故与上游 1.11.2 区分。
-const appVersion = "1.12.2-panel"
+// 两域模型汇聚 / 跨域模型路由 / 账号信息脱敏 / 任务队列自动扫描执行），故与上游
+// 1.11.2 区分。
+const appVersion = "1.12.3-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -176,6 +177,11 @@ func main() {
 	// 回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
 	upstream.SetModelCatalogPath(stateSibling(cfg.StateFile, "model.json"))
 
+	// 面板实例的前向引用：调度器需要"到点触发任务队列自动执行"的回调，而面板构造在
+	// 调度器之后（面板持有调度器做手动触发）。回调只在整点被调用，彼时 pnRef 已赋值；
+	// 仍留 nil 判断，避免构造失败路径下的空指针。
+	var pnRef *panel.Panel
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
 		Upstream:       up,
@@ -184,6 +190,7 @@ func main() {
 		ActivityHours:  cfg.Schedule.ActivityHours,
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
 		BlackcatHours:  cfg.Schedule.BlackcatHours,
+		TaskAutoHours:  cfg.Schedule.TaskAutoHours,
 		// 快过期积分优先消耗：签到/余额刷新按此窗口分桶（issue:积分过期）。
 		ExpiringSoonWindow: cfg.ExpiringSoonDur,
 		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
@@ -191,6 +198,15 @@ func main() {
 		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
 		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
 		BlackcatDisabled:   !cfg.Schedule.BlackcatEnabled,
+		TaskAutoDisabled:   !cfg.Schedule.TaskAutoEnabled,
+		// 任务队列自动扫描+执行：到点扫全部账号待办，有待办才排队执行。
+		// 回调内部自行异步（契约见 scheduler.Config.TaskAutoFn）——队列含真实对话，
+		// 单轮可达数十分钟，排程主循环不能等它，否则跨过后续时点会漏跑签到/保活。
+		TaskAutoFn: func() {
+			if pnRef != nil {
+				go pnRef.RunAutoQueueNow()
+			}
+		},
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -227,6 +243,13 @@ func main() {
 	case cfg.BalanceRefreshInterval > 0:
 		log.Printf("余额后台刷新：每 %s（签到时点照常额外刷新）", cfg.BalanceRefreshInterval)
 	}
+	switch {
+	case !cfg.Schedule.TaskAutoEnabled:
+		log.Printf("任务队列自动执行已禁用（schedule.task_auto_enabled=false；面板「任务中心」可一键开启）")
+	default:
+		log.Printf("任务队列自动执行已启用：%v 点（自动扫描全部账号待办 → 有待办才排队执行，并发 %d）",
+			cfg.Schedule.TaskAutoHours, cfg.Schedule.TaskAutoConcurrency)
+	}
 
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
 	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
@@ -257,7 +280,9 @@ func main() {
 			return Load(*cfgPath)
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
-			return saveConfig(raw, *cfgPath, live, p, up, sch)
+			// 经 pnRef 转发：面板变量在构造闭包里尚不在作用域（Go 的短变量声明
+			// 作用域始于声明语句之后），而热改需要面板实例同步自动执行快照。
+			return saveConfig(raw, *cfgPath, live, p, up, sch, pnRef)
 		},
 		// 当前生效的系统提示词（模式/文本/来源），供面板「配置」页展示与"载入当前生效"。
 		// 读 Live 快照而非启动期 cfg：面板保存后立即反映新值，不会显示过期内容。
@@ -268,6 +293,10 @@ func main() {
 			return panel.PromptSnapshot{Mode: cfg.Prompt.Mode, Text: cfg.PromptText, Source: cfg.PromptSource}
 		},
 	})
+	// 面板装配完成：接上调度器的自动执行回调，并同步自动执行展示快照
+	// （面板状态接口据此显示开关/时点/下次执行时刻）。
+	pnRef = pn
+	pn.SetTaskAuto(cfg.Schedule.TaskAutoEnabled, cfg.Schedule.TaskAutoHours, cfg.Schedule.TaskAutoConcurrency)
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
@@ -337,7 +366,7 @@ func panelListenPath(listen string) string {
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
 //   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights/SetCostExploreInterval
-//   - schedule.* → scheduler.Reconfigure/SetBalanceInterval
+//   - schedule.* → scheduler.Reconfigure/ReconfigureTaskAuto/SetBalanceInterval + panel.SetTaskAuto
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
 //   - listen / auth_dir / state_file / upstream.* / upstash.* / session_sticky.*（TTL 类）
@@ -345,7 +374,7 @@ func panelListenPath(listen string) string {
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
-func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, pn *panel.Panel) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
@@ -429,6 +458,12 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
 		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
+	// 任务队列自动执行：排程时点/开关热改 + 面板展示快照同步（状态接口据此显示
+	// 开关与下次执行时刻）。pn 为 nil 只可能出现在测试装配里。
+	sch.ReconfigureTaskAuto(newCfg.Schedule.TaskAutoHours, !newCfg.Schedule.TaskAutoEnabled)
+	if pn != nil {
+		pn.SetTaskAuto(newCfg.Schedule.TaskAutoEnabled, newCfg.Schedule.TaskAutoHours, newCfg.Schedule.TaskAutoConcurrency)
+	}
 
 	return restartRequiredFields(newCfg), nil
 }

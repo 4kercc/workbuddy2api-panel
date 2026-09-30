@@ -13,13 +13,16 @@
     "activity_hours": [10],
     "keepalive_hours": [22],
     "blackcat_hours": [23],
+    "task_auto_hours": [10, 20],
     "checkin_enabled": true,
     "travel_enabled": true,
     "activity_enabled": true,
     "keepalive_enabled": true,
     "blackcat_enabled": true,
     "balance_refresh_enabled": true,
-    "balance_refresh_minutes": 5
+    "balance_refresh_minutes": 5,
+    "task_auto_enabled": false,
+    "task_auto_concurrency": 1
   },
   "global": {
     "enabled": true,

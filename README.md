@@ -96,6 +96,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 - **全账号任务扫描**：一键拉取每个账号的成长任务（未完成且可自动化的 19 项，含小程序口径的「校园日」与「小程序首对话」）+ 开学季待办，列表一目了然
 - **执行队列**：把待办按账号排队执行——账号内串行（与单任务/一键完成共用互斥锁），账号间可选并发（1-3）；执行进度实时更新到每个条目
+- **自动扫描 + 自动执行**：开启后按 `schedule.task_auto_hours`（默认 `[10, 20]` 整点）自动扫全部账号待办，**有待办才排队执行**，无待办零动作；面板「成长任务队列」右上角开关一键启停（写回 config，立即生效），旁边显示下次执行时刻与上一轮结果。默认**关闭**——队列含真实对话任务，升级不会无声开跑
 - **开学季独立状态卡**：每账号 5 任务（分享/桌面/对话×3/专家/学生认证）的状态矩阵 + 剩余抽奖次数，一键触发全账号闭环
 - **日志分频道**：运行日志按「任务 / 对话 / 系统」三个频道筛选——对话流量再大，任务结果也不会被冲掉；日志条目带频道徽标与时间
 
@@ -166,6 +167,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **首启自动生成配置** | 目录下无 `config.json` 时自动生成推荐配置（含 `crypto/rand` 随机 `api_key`），双击即开 |
 | **粘性会话内容回退** | 客户端不发 `conversation_id` 时，用 `system + 首条 user` 哈希派生会话键（`d-` 前缀），通用 OpenAI 客户端也能享受粘性 |
 | **余额后台刷新** | `schedule.balance_refresh_minutes`（默认 5）周期查余额并更新池，冷却账号余额恢复自动解冻 |
+| **成长任务队列自动化** | 手动「扫描待办 / 执行全部待办」之外，可开启 `schedule.task_auto_enabled`：按 `task_auto_hours`（默认 10/20 点）自动扫描并执行待办，无待办零动作；与手动执行共用互斥闸，长任务不阻塞其它排程 |
 | **模型能力透出** | `/v1/models` 附带 `supported_efforts` / `default_effort` / 积分倍率 / 输入输出上限等上游真实字段 |
 | **安全加固** | 常量时间密钥比较（`internal/httpauth`）、CSP 与安全响应头、UID 白名单防路径穿越、前端属性转义修复 |
 | **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |
@@ -349,11 +351,14 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `schedule.activity_hours` | `[10]` | 每日本地时区整点对话活跃上报（点亮连登 + 解锁 `first_buddy`） |
 | `schedule.keepalive_hours` | `[22]` | 每日本地时区整点刷新 token 保活 |
 | `schedule.blackcat_hours` | `[23]` | 每日本地时区整点夜猫子补足（23:00–08:00 计数窗口） |
+| `schedule.task_auto_hours` | `[10, 20]` | 每日本地时区整点自动扫描全部账号待办并执行（有待办才跑）；空数组 / `null` = 未配置回落默认 |
 | `schedule.checkin_enabled` | `true` | 签到总开关；`false` 真正关闭 |
 | `schedule.travel_enabled` | `true` | 猫猫旅行总开关（独立于签到） |
 | `schedule.activity_enabled` | `true` | 活跃上报总开关 |
 | `schedule.keepalive_enabled` | `true` | token 保活总开关 |
 | `schedule.blackcat_enabled` | `true` | 夜猫子总开关 |
+| `schedule.task_auto_enabled` | `false` | 成长任务队列自动扫描 + 执行总开关（**默认关闭**：队列含真实对话任务）；面板「任务中心」可一键开启 |
+| `schedule.task_auto_concurrency` | `1` | 自动执行的账号间并发（账号内恒串行），1-4，越界回落 1 |
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
@@ -470,6 +475,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 猫猫旅行 | `schedule.travel_enabled` | `travel_hours` `[9, 21]` 整点 | 独立排程：无猫领养 / `idle` 派出 / `arrived` 领奖 |
 | 保活 | `schedule.keepalive_enabled` | `keepalive_hours` `[22]` 整点 | 全账号刷新 token；session 失效**连续 3 次**才自动禁用 |
 | 夜猫子 | `schedule.blackcat_enabled` | `blackcat_hours` `[23]` 整点 | **先查任务进度再决定**：`black_cat` 未达标才在 23:00–08:00 计数窗口内补足 glm-5.2 短对话（每天 1 次累计 3 天，漏跑次日窗口自动补） |
+| 成长任务队列（自动） | `schedule.task_auto_enabled`（**默认 false**） | `task_auto_hours` `[10, 20]` 整点 | 自动扫描全部账号的成长任务 + 开学季待办，**有待办才排队执行**（口径与手动「执行全部待办」完全一致），跑完记日志与面板状态。账号间并发 `task_auto_concurrency`（默认 1，账号内恒串行） |
 
 #### 连登管家（签到排程末尾自动执行）
 
@@ -480,11 +486,24 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 无需配置，跟随签到排程；到天数那天自动完成「兑换 → 抽奖」，无需人工盯。
 
-**关闭定时任务**：用 `schedule.*_enabled: false` 显式关闭（四个都设 `false` 则调度器不空转，直接阻塞等待退出信号）。注意两点语义：
+**关闭定时任务**：用 `schedule.*_enabled: false` 显式关闭（全部设 `false` 则调度器不空转，直接阻塞等待退出信号）。注意两点语义：
 
 - **空数组与 `null` 表示「未配置 → 回落默认」**，不是「禁用」；真正关闭请用 `*_enabled: false`
 - **禁用不会擦除小时配置**：`*_hours` 原样保留，改回 `true` 即恢复原时点；小时值必须是 0-23，非法值启动即报错
 - 关签到会把「余额恢复即解冻」一起关掉，被硬冷却的账号只能等次日 04:00 自然到期
+
+> 唯一的「默认关闭」开关是 `schedule.task_auto_enabled`：任务队列里的动作含真实对话（expert 系每账号每轮 8 次），升级即自动开跑等于未经同意消耗配额。想全自动的用户在面板「任务中心 → 成长任务队列」点开开关即可（保存进 config，立即生效），也可直接写 `"task_auto_enabled": true`。
+
+#### 成长任务队列自动执行（`task_auto_enabled`）
+
+到点（`task_auto_hours`，默认 10:00 / 20:00）自动跑一轮，与手动点「执行全部待办」同一条代码路径：
+
+1. 扫描全部非禁用账号的成长任务（含小程序口径）+ 开学季待办，只读、并发拉取
+2. **没有任何待办就直接结束**（只打一行日志，不发起任何任务动作）
+3. 有待办则按账号排队执行：账号内串行（与单任务/一键完成共用互斥锁）、账号间并发 `task_auto_concurrency`；跑完自动领奖并回读进度
+4. 结果写进队列状态（面板可见每个条目）+ 日志 `panel: 自动任务队列结束：成功 x / 失败 y / 跳过 z`
+
+并发保护：自动轮次与手动「执行全部待办」共用同一道启动闸——队列已在跑时自动轮次直接跳过（不排队堆积，下个时点再来）。长任务不会阻塞排程主循环：回调只做到点触发，实际执行在独立 goroutine 里，签到/保活等整点照常。
 
 #### 活跃上报（独立排程）
 
@@ -546,6 +565,8 @@ http://127.0.0.1:7863/panel/
 顶部「刷新」按钮 = 向上游全量查询真实余额并回写（5 秒自动轮询只读内存，不打上游）。
 
 面板后端接口挂在 `/panel/api/*`（同一 Bearer 鉴权），可脚本化调用；账号运维操作均落到池既有入口（`Revive`/`Disable`/`Remove` 等），与 `/status` 观测口径一致。
+
+任务中心相关端点：`POST /panel/api/tasks/scan_all`（只读扫描待办）、`POST /panel/api/tasks/run_queue`（扫描并启动执行队列）、`GET /panel/api/tasks/queue`（队列进度）、`GET /panel/api/tasks/auto`（自动执行状态：开关 / 时点 / 并发 / 下次执行时刻 / 上一轮结果）。开关本身走 `POST /panel/api/config`（`{"schedule":{"task_auto_enabled":true}}`），保存即热生效。
 
 **安全响应头**：面板页面与全部 `/panel/api/*` 响应统一带 `Content-Security-Policy`（`default-src 'none'`，脚本仅同源，`frame-ancestors 'none'` 禁嵌套）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 等；前端脚本独立为同源 `app.js`，不含内联脚本与内联事件处理器。
 

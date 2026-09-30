@@ -90,6 +90,14 @@ type Panel struct {
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
+
+	// 任务队列「自动扫描 + 自动执行」的展示快照（开关/时点/并发）。
+	// 排程真值在 scheduler（main 装配期注入回调与时点），面板只保留一份副本供
+	// 状态接口展示"下次自动执行时间"，由 main 在启动与保存配置后经 SetTaskAuto 同步。
+	autoMu    sync.Mutex
+	autoOn    bool
+	autoHours []int
+	autoConc  int
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -171,6 +179,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/tasks/scan_all", p.withAuth(p.tasksScanAll))
 	p.mux.HandleFunc("POST /panel/api/tasks/run_queue", p.withAuth(p.tasksRunQueue))
 	p.mux.HandleFunc("GET /panel/api/tasks/queue", p.withAuth(p.tasksQueueStatus))
+	p.mux.HandleFunc("GET /panel/api/tasks/auto", p.withAuth(p.tasksAutoStatus))
 	p.mux.HandleFunc("GET /panel/api/school/status", p.withAuth(p.schoolStatus))
 	p.mux.HandleFunc("POST /panel/api/school/run_all", p.withAuth(p.schoolRunAll))
 	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))

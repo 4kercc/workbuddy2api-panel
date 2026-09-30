@@ -19,8 +19,10 @@ import (
 
 // Config 调度器依赖。
 //
-// 任务开关用「禁用」命名而非「启用」：零值 Config 即四类任务都启用（hours 回落默认），
-// 与引入开关前的行为逐字一致（老调用方/老测试无需改动）。
+// 任务开关用「禁用」命名而非「启用」：零值 Config 即签到/旅行/活跃/保活/夜猫子
+// 五类任务都启用（hours 回落默认），与引入开关前的行为逐字一致（老调用方/老测试
+// 无需改动）。唯一的例外是任务队列自动执行（TaskAutoDisabled，零值即关闭），
+// 理由见该字段注释。
 type Config struct {
 	Pool           *pool.Pool
 	Upstream       *upstream.Client
@@ -29,6 +31,7 @@ type Config struct {
 	ActivityHours  []int // 默认 [10]
 	KeepaliveHours []int // 默认 [22]
 	BlackcatHours  []int // 默认 [23]：夜猫子（23:00–08:00 计数窗口）
+	TaskAutoHours  []int // 默认 [10,20]：成长任务队列自动扫描 + 自动执行
 
 	// ExpiringSoonWindow 快过期积分窗口：签到/余额刷新查余额时，把到期时间
 	// <= now+window 的套餐余额标记为"快过期"（pool 据此优先消耗，见
@@ -47,6 +50,18 @@ type Config struct {
 	KeepaliveDisabled bool
 	// BlackcatDisabled 显式关闭夜猫子排程（schedule.blackcat_enabled=false）。
 	BlackcatDisabled bool
+	// TaskAutoDisabled 显式关闭「任务队列自动扫描+执行」排程
+	// （schedule.task_auto_enabled=false）。**本项零值即关闭**——与上面五项
+	// 「零值即启用」刻意相反：队列含真实对话任务，升级后不得无声开始消耗配额，
+	// 必须由用户显式开启。
+	TaskAutoDisabled bool
+
+	// TaskAutoFn 任务队列自动执行的落地回调（main 注入面板实现：扫描待办 →
+	// 有待办则排队执行 → 回写队列状态）。nil = 未装配，静默跳过（老调用方零影响）。
+	//
+	// 契约：回调内部**必须自行异步**（队列含真实对话任务，单轮可达数十分钟），
+	// 排程主循环不等待它——否则跨过后续时点会让签到/保活整点漏跑。
+	TaskAutoFn func()
 }
 
 // Scheduler 调度器。
@@ -87,6 +102,9 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.BlackcatHours) == 0 {
 		cfg.BlackcatHours = []int{23}
 	}
+	if len(cfg.TaskAutoHours) == 0 {
+		cfg.TaskAutoHours = []int{10, 20}
+	}
 	return &Scheduler{
 		cfg:           cfg,
 		adoptTried:    make(map[string]string),
@@ -125,6 +143,38 @@ func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepal
 	poke(s.rearmBalance)
 }
 
+// ReconfigureTaskAuto 热更新「任务队列自动扫描+执行」的时点与开关（面板保存配置后调用）。
+// 单独成方法而非并入 Reconfigure：后者已有 10 个位置参数，继续堆会让调用点不可读。
+// 空 hours 视为「未配置」保留原值（与 config.normalize 的回落语义一致）。
+func (s *Scheduler) ReconfigureTaskAuto(hours []int, disabled bool) {
+	s.schedMu.Lock()
+	if len(hours) > 0 {
+		s.cfg.TaskAutoHours = hours
+	}
+	s.cfg.TaskAutoDisabled = disabled
+	s.schedMu.Unlock()
+	poke(s.rearmSchedule)
+}
+
+// taskAutoFn 读取任务队列自动执行回调（schedMu 下快照；未装配返回 nil）。
+func (s *Scheduler) taskAutoFn() func() {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+	return s.cfg.TaskAutoFn
+}
+
+// NextTaskAutoAt 返回 now 之后最近的任务队列自动执行时刻；未启用/未装配/无时点
+// 返回零值。供面板展示"下次自动执行"，与排程主循环共用同一份 nextFire 口径。
+func (s *Scheduler) NextTaskAutoAt(now time.Time) time.Time {
+	s.schedMu.Lock()
+	off, has, hours := s.cfg.TaskAutoDisabled, s.cfg.TaskAutoFn != nil, s.cfg.TaskAutoHours
+	s.schedMu.Unlock()
+	if off || !has || len(hours) == 0 {
+		return time.Time{}
+	}
+	return nextFire(now, hours)
+}
+
 // poke 非阻塞发一次唤醒信号（已有待处理信号则忽略，语义等价）。
 func poke(ch chan struct{}) {
 	select {
@@ -157,6 +207,7 @@ const (
 	taskActivity
 	taskKeepalive
 	taskBlackcat
+	taskTaskAuto // 任务队列自动扫描 + 执行（回调注入，见 Config.TaskAutoFn）
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -167,8 +218,10 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	s.schedMu.Lock()
 	checkinHours, keepaliveHours, blackcatHours := s.cfg.CheckinHours, s.cfg.KeepaliveHours, s.cfg.BlackcatHours
 	travelHours, activityHours := s.cfg.TravelHours, s.cfg.ActivityHours
+	taskAutoHours := s.cfg.TaskAutoHours
 	checkinOff, keepaliveOff, blackcatOff := s.cfg.CheckinDisabled, s.cfg.KeepaliveDisabled, s.cfg.BlackcatDisabled
 	travelOff, activityOff := s.cfg.TravelDisabled, s.cfg.ActivityDisabled
+	taskAutoOff, hasTaskAuto := s.cfg.TaskAutoDisabled, s.cfg.TaskAutoFn != nil
 	s.schedMu.Unlock()
 
 	type slot struct {
@@ -190,6 +243,10 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	}
 	if !blackcatOff {
 		slots = append(slots, slot{nextFire(now, blackcatHours), taskBlackcat})
+	}
+	// 任务队列自动执行：仅当开关打开**且**回调已装配（面板在才有意义）。
+	if !taskAutoOff && hasTaskAuto {
+		slots = append(slots, slot{nextFire(now, taskAutoHours), taskTaskAuto})
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -241,7 +298,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 	for {
 		next, kinds := s.nextWake(time.Now())
 		if next.IsZero() {
-			// 四类任务全部禁用：不空转，等重排通知（在线改配置重新启用）或退出信号。
+			// 全部任务禁用：不空转，等重排通知（在线改配置重新启用）或退出信号。
 			select {
 			case <-ctx.Done():
 				return
@@ -292,6 +349,12 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 				s.RunKeepaliveNow()
 			case taskBlackcat:
 				s.RunBlackcatNow()
+			case taskTaskAuto:
+				// 回调自行异步（契约见 Config.TaskAutoFn）：这里只负责到点触发，
+				// 不等队列跑完，避免长任务跨过后续时点让签到/保活漏跑。
+				if fn := s.taskAutoFn(); fn != nil {
+					fn()
+				}
 			}
 		}(k)
 	}
