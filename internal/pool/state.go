@@ -469,6 +469,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Nickname:          e.a.Nickname,
 		Credits:           e.credits,
 		CreditsTotal:      e.creditsTotal,
+		EarnedToday:       e.earnedTodayAt(now),
 		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
 		Reason:            e.reason,
 		Disabled:          e.disabled,

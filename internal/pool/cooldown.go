@@ -8,10 +8,51 @@ import (
 	"time"
 )
 
+// creditDayLayout 是「今日新增积分」的分日键格式（本地时区，与用户直觉一致）。
+const creditDayLayout = "2006-01-02"
+
+// noteAuthoritativeCreditsLocked 用一次**权威**余额观测推进「今日新增积分」台账。
+//
+// 只在权威写入点（SetCredits/SetCreditsDetailed，即签到与余额刷新）调用。刻意不认
+// NoteModelCost 的本地扣减：那是两次刷新之间的内插估计，拿它当基准会把"扣减被权威值
+// 修正回来"记成新增——每次聊天后的余额刷新都会虚增一笔，今日新增会变成消耗量的镜像。
+//
+// 只累计正向增量（消耗不抵减）：用户问的是"今天赚了多少"，不是净变化。代价是同一
+// 刷新窗口内既赚又花时增量被抵掉——余额刷新默认 5 分钟一次，窗口很窄，且偏差偏保守。
+//
+// 调用方必须已持有 p.mu。
+func (e *entry) noteAuthoritativeCreditsLocked(newCredits int64, now time.Time) {
+	day := now.Format(creditDayLayout)
+	// 首次观测只建基准不记账：新账号 Add 时 credits=0，第一次刷新会把整份余额误记成
+	// "今天赚的"。基准有效性用 earnedDay 非空表示（本函数是这两个字段的唯一写入方）。
+	known := e.earnedDay != ""
+	if e.earnedDay != day {
+		// 跨天归零重新累计；基准 creditsAuth 保持不动——它仍是有效的上次观测，
+		// 正是"今天相对上次观测涨了多少"要用的比较对象。
+		e.earnedDay = day
+		e.earnedToday = 0
+	}
+	if known && newCredits > e.creditsAuth {
+		e.earnedToday += newCredits - e.creditsAuth
+	}
+	e.creditsAuth = newCredits
+}
+
+// earnedTodayAt 是上面台账的读侧：分日键不是今天就不认账——跨天后到首次余额刷新
+// 之间内存里还留着昨天的累计，直接透出会让面板把昨天的数字显示成"今日新增"。
+// 调用方必须已持有 p.mu。
+func (e *entry) earnedTodayAt(now time.Time) int64 {
+	if e.earnedDay != now.Format(creditDayLayout) {
+		return 0
+	}
+	return e.earnedToday
+}
+
 func (p *Pool) SetCredits(uid string, credits, total int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
+		e.noteAuthoritativeCreditsLocked(credits, time.Now())
 		e.credits = credits
 		e.creditsTotal = total
 		p.dirty.Store(true)
@@ -31,6 +72,7 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64) {
 		if expiring > credits {
 			expiring = credits
 		}
+		e.noteAuthoritativeCreditsLocked(credits, time.Now())
 		e.credits = credits
 		e.creditsTotal = total
 		e.creditsExpiring = expiring

@@ -237,6 +237,11 @@ async function loadOverview(quiet) {
     const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
   const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
   $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
+    /* 今日新增积分：各账号当日正向增量之和。后端已按本地自然日过滤（跨天/无观测即 0），
+       前端只管求和与符号。>0 时标绿并加 "+"，让"今天有进账"一眼可辨。 */
+    const earnedSum = (d.accounts || []).reduce((a, s) => a + (s.credits_earned_today || 0), 0);
+    $('sEarned').textContent = (earnedSum > 0 ? '+' : '') + earnedSum;
+    $('sEarnedStat').classList.toggle('good', earnedSum > 0);
     $('sSticky').textContent = d.sticky_sessions;
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;

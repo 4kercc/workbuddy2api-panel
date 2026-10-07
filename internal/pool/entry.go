@@ -65,6 +65,10 @@ type Status struct {
 	Nickname      string    `json:"nickname,omitempty"`
 	Credits       int64     `json:"credits"`
 	CreditsTotal  int64     `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
+	// EarnedToday 当日新增积分（本地时区自然日）。口径 = 签到/余额刷新等**权威**余额
+	// 观测的正向增量累计，消耗不抵减——回答"今天赚了多少"而非"净变化多少"。
+	// 零值也透出：0 = 今天确实没新增（与 credits_total 的 0=未知 不同）。
+	EarnedToday   int64     `json:"credits_earned_today"`
 	Cooling       bool      `json:"cooling"`
 	CoolKind      string    `json:"cool_kind,omitempty"`
 	CoolRemaining int64     `json:"cool_remaining_sec,omitempty"`
@@ -165,16 +169,27 @@ type entry struct {
 	// 额外加成：优先消耗快过期积分，避免官方活动赠送的奖励积分到期作废。
 	// 运行态，签到/余额刷新时更新，不单独持久化（credits 仍持总量）。
 	creditsExpiring int64
-	successCount    int64      // 累计成功
-	errTotal        int64      // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
-	lastErr         time.Time  // 最近一次错误时间
-	lastSuccess     time.Time  // 最近一次成功时间
-	tokenUsage      TokenUsage // 聊天请求 token 用量摘要（持久化）
-	coolKind        CoolKind
-	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
-	disabled        bool
-	reason          string
-	lastUsed        time.Time // 最近被选中时刻（防并发撞号）
+	// creditsAuth 最近一次**权威**余额观测（SetCredits/SetCreditsDetailed 写入）。
+	// 与 credits 刻意分开：credits 会被 NoteModelCost 按本次请求消耗做本地内插扣减，
+	// 拿它当"今日新增"的基准会把"扣减被权威值修正回来"记成新增（每次聊天后刷新虚增一笔）。
+	// 持久化，重启后基准不丢。
+	creditsAuth int64
+	// earnedToday 当日累计新增积分（只累加权威余额的**正向**增量，消耗不抵减）。
+	// earnedDay 是它的分日键（本地时区 YYYY-MM-DD）；两者同时持久化。
+	// earnedDay 非空即"已有过权威观测"——首次观测只建基准不记账（见
+	// noteAuthoritativeCreditsLocked），故它同时充当基准有效标志。
+	earnedToday int64
+	earnedDay   string
+	successCount int64      // 累计成功
+	errTotal     int64      // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
+	lastErr      time.Time  // 最近一次错误时间
+	lastSuccess  time.Time  // 最近一次成功时间
+	tokenUsage   TokenUsage // 聊天请求 token 用量摘要（持久化）
+	coolKind     CoolKind
+	until        time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
+	disabled     bool
+	reason       string
+	lastUsed     time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。
@@ -381,6 +396,11 @@ func (e *entry) fallbackKind(now time.Time) string {
 type stateAccount struct {
 	Credits      int64     `json:"credits"`
 	CreditsTotal int64     `json:"credits_total,omitempty"`
+	// 今日新增积分台账（见 entry.creditsAuth/earnedToday/earnedDay）：持久化以让
+	// 「今日新增」跨重启连续——重启归零会让当天已赚的积分凭空消失。
+	CreditsAuth int64      `json:"credits_auth,omitempty"`
+	EarnedToday int64      `json:"earned_today,omitempty"`
+	EarnedDay   string     `json:"earned_day,omitempty"`
 	Disabled     bool      `json:"disabled"`
 	Reason       string    `json:"reason,omitempty"`
 	Until        time.Time `json:"until,omitempty"`
