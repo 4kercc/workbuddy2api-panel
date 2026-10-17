@@ -2,7 +2,7 @@
 
 > 记录时间：2026-09-23
 > 基线版本：`1.11.2-panel`（上游 commit `5a6b167`）
-> 状态：**均已实现、测试、部署验证，但尚未提交**
+> 状态：**已实现、测试、部署验证，并已提交到 `dev` 分支**（部署与提交状态见文末变更记录）
 
 本文件记录对 workbuddy2api-panel 的两项改动：
 
@@ -354,8 +354,15 @@ Docker Compose 常驻（`restart: unless-stopped`，宿主 docker 守护进程 `
 
 - 面板：`http://<服务器IP>:7863/panel/`
 - OpenAI 兼容端点：`http://<服务器IP>:7863/v1`
-- 运行版本：`1.12.1-panel`（服务器容器已重建对齐）
-- 账号池：9 个，全部可用
+- 运行版本：`1.12.5-panel`（2026-10-18 重建对齐）
+- 仓库形态：**fork 的正常 clone**——`origin` = `4kercc/workbuddy2api-panel`，
+  `upstream` = `linguo2625469/workbuddy2api-panel`，当前分支 `dev`（跟踪 `origin/dev`）。
+  部署命令：`git pull --ff-only && docker compose up -d --build`。
+  历史：2026-10-07 之前服务器上只有未提交的工作树改动，当天已全部固化为 `dev` 提交，
+  之后每次部署都走 git。
+- 账号池：15 个 —— **12 可用 / 3 已禁用**。这 3 个 CN 号的 refresh token 被上游判定
+  失效（`invalid_grant: Session doesn't have required client`），需重新 OAuth 登录；
+  详见文末 2026-10-18 变更记录。
 - 提示词配置：`passthrough`（保持原状，未改动）
 - 模型汇聚：**已开启**（`panel.model_merge: true`，验证后保留；配置页取消勾选即关闭）
 - 跨域模型：**已开启**（`routing.cross_realm_models: ["deepseek-v4.1-flash"]`，验证后保留）
@@ -366,10 +373,19 @@ Docker Compose 常驻（`restart: unless-stopped`，宿主 docker 守护进程 `
 
 ## 待办
 
-- **改动尚未提交**。本地与服务器两份仓库都是未提交状态（14 个文件）。服务器那份一旦
-  `git pull` 或 `git reset --hard` 会被覆盖，需要建分支提交或导出 patch 固化。
-- **`project.md` 被 `.gitignore` 排除**。仓库约定 `*.md` 全部忽略（仅 `!README.md` 例外），
-  因此本文件不会进版本库。若要纳入，需在 `.gitignore` 补 `!project.md`。
+- ~~**改动尚未提交**。本地与服务器两份仓库都是未提交状态（14 个文件）。服务器那份一旦
+  `git pull` 或 `git reset --hard` 会被覆盖，需要建分支提交或导出 patch 固化。~~
+  **已解决（2026-10-07）**：fork 成果已全部提交并推到 `4kercc/workbuddy2api-panel` 的
+  `dev` 分支；服务器 `/root/workbuddy2api-panel` 已改为该 fork 的正常 clone
+  （`dev` 跟踪 `origin/dev`），不再存在「未提交改动被 pull 覆盖」的风险。
+- ~~**`project.md` 被 `.gitignore` 排除**。仓库约定 `*.md` 全部忽略（仅 `!README.md` 例外），
+  因此本文件不会进版本库。若要纳入，需在 `.gitignore` 补 `!project.md`。~~
+  **已解决**：`.gitignore` 已补 `!project.md`，本文件随代码进版本库。
+  （服务器那份含真实 IP 的未脱敏原文，在 2026-10-07 首次 git 部署时按设计被脱敏版替换；
+  备份在服务器 `/root/workbuddy2api-panel-project.md.bak`。）
+- **待人工处理**：3 个 CN 号（`18587313131` / `16608713131` / `꯭刺꯭猬꯭`）已因上游 401
+  被自动禁用，需在面板「添加账号」重走 OAuth。**点「解冻」无效**——refresh token 已失效，
+  解冻只会让它在 15 分钟内再次被判失效并禁用。
 
 ## 运维注意
 
