@@ -988,7 +988,8 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //     起 · softStreak 指数、封顶 soft_rate_max 的既有 CooldownSoftRate 有界退避。
 //     基数经 jitterDur 抖动（防多账号同相位冷却到期再聚团）。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩。
-//   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
+//   - ErrSessionDead → 12153（上游明说 offline session）立即 Disable；裸 401（无
+//     12153 文案，如 APISIX 网关鉴权页）走连续计数，达阈值才 Disable（需人工重登）。
 //   - ErrContentBlocked → 不罚账号；passthrough 首遇触发降级重试，最终仍拦则回 400。
 //   - ErrBadParams → 不罚账号（同 ErrContentBlocked 待遇），但仍轮转。
 //   - ErrPromptTooLong → 11115：请求的问题不是账号的问题。零动作（不冷却/不熔断/
@@ -1045,6 +1046,19 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		}
 		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
 	case upstream.ErrSessionDead:
+		// 12153（"Offline user session not found"）是上游明确判定的 session 终态 →
+		// 立即禁用。裸 401（无 12153 文案，如 APISIX 网关回的 401 HTML）同样代表
+		// 凭证被拒，但可能只是瞬时抖动 → 走连续计数（与 keepalive / 余额刷新共用
+		// 计数器），达到阈值才禁用——一次失败就杀号是 P0-1 的历史教训（13 个被误
+		// 禁用的号 refresh 全部成功）。
+		if !strings.Contains(body, "12153") && !strings.Contains(body, "Offline user session not found") {
+			const reason = "401 auth failed (re-login required)"
+			if h.cfg.Pool.NoteSessionDeadReason(uid, reason) {
+				log.Printf("WARN: [server] 401 acct=%s: 连续 %d 次鉴权失败 — 禁用（需重新登录）",
+					logfmt.Label(uid, ""), pool.SessionDeadThreshold())
+			}
+			return
+		}
 		h.cfg.Pool.Disable(uid, "12153 session dead")
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：

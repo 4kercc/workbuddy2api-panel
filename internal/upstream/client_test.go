@@ -63,7 +63,12 @@ func TestClassify(t *testing.T) {
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},
 		{401, `Offline user session not found`, ErrSessionDead},
 		{401, `{"code":12153,"msg":"Offline user session not found"}`, ErrSessionDead},
-		{401, `{"code":9999,"msg":"bad token"}`, ErrClient},
+		// 401 一律是鉴权失败（凭证失效）：带业务信封的 12153 与 APISIX 网关的裸 401
+		// HTML 同归 session_dead。此前「401 + 未知业务码」判 ErrClient → 只换号不罚，
+		// 死号永远留在池里、面板一直显示可用（2026-10 实测 3 个 CN 号连续 10 天 401，
+		// 池仍报 15/15 可用）。裸 401 无任何 marker，必须靠状态码兜住。
+		{401, `{"code":9999,"msg":"bad token"}`, ErrSessionDead},
+		{401, `<html><head><title>401 Authorization Required</title></head><body><center><h1>401 Authorization Required</h1></center></body></html>`, ErrSessionDead},
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
 		{200, ``, ErrNone},

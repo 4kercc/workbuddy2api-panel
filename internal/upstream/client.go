@@ -29,7 +29,7 @@ const (
 	ErrNone           ErrKind = iota // 成功
 	ErrHardCredit                    // 余额不足（402 或 body 关键词）→ 长冷却
 	ErrSoftRate                      // 429 软限流 → 短冷却
-	ErrSessionDead                   // 401 + 12153 offline session 失效 → 禁用
+	ErrSessionDead                   // 401 鉴权失败（12153 offline session / APISIX 裸 401 HTML）→ 禁用或连续计数
 	ErrNotFound                      // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
 	ErrServer                        // 5xx 上游故障
 	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
@@ -448,7 +448,8 @@ func ParseRateReset(body string) (time.Time, bool) {
 // 判定顺序自「严」到「宽」，每层的先后都有语义依据：
 //  0. 11102（IsModelBlocked）——「该后端无此模型」确定性答复，语义最具体，最先判
 //     （只认 400/404，429+11102 属限流语义走第 4 层）。
-//  1. 402 —— 真正的计费余额耗尽状态码，最严、最不可自愈，最先判。
+//  1. 402 / 401 —— 402 是计费余额耗尽；401 是鉴权被拒（凭证失效，含 APISIX 裸 401
+//     HTML 与带业务信封的 12153）。两者都是账号级终态、最不可自愈，最先判。
 //  2. sessionDeadMarkers —— 需要人工重登的终态。若 401 body 同时含 "12153" 与
 //     "rate limit"（如网关错误页混排），归 session_dead：短冷却救不活失效 session，
 //     误判为限流会让该死号留在池中反复被选中；且此层 marker 是精确词（12153 等），
@@ -487,6 +488,16 @@ func Classify(status int, body string) ErrKind {
 	// 402：真正的计费余额耗尽状态码，最严、最不可自愈，最先判。
 	if status == http.StatusPaymentRequired {
 		return ErrHardCredit
+	}
+	// HTTP 401 = 鉴权被拒（凭证已失效），属于账号级终态，不是请求问题。
+	//
+	// 上游有两种形态：带业务信封的 12153（下方 sessionDeadMarkers 层已覆盖）与
+	// APISIX 网关直接回的裸 401 HTML（无信封、无任何 marker）。后者此前一路落到
+	// 4xx 兜底 ErrClient → 只换号不罚 → 死号永远留在池里：2026-10 实测 3 个 CN 号
+	// 连续 10 天余额查询 401，池仍报 15/15 可用、首页「服务正常」，运维完全看不到。
+	// 判在 marker 层之前：401 无论如何都是鉴权失败，与 marker 层对 12153 的结论一致。
+	if status == http.StatusUnauthorized {
+		return ErrSessionDead
 	}
 	lower := strings.ToLower(body)
 	// sessionDead / accountFault 先于 status==429：账号级终态等不来自愈，限流状态码

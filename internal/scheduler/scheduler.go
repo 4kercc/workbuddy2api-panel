@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -533,8 +534,27 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
 			if err != nil {
 				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
+				// 鉴权失败回写池状态：余额刷新是每 5 分钟一次的全量体检，必须让它成为
+				// 死号的检测入口——否则上游 401 只在这里刷日志，池里该号仍是「可用」，
+				// 面板/首页一直显示正常（2026-10 实测：3 个 CN 号连续 10 天 401，
+				// 池仍报 15/15 可用）。连续 sessionDeadThreshold 次才禁用，防瞬时抖动。
+				var ue *upstream.Error
+				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+					// 两种上游形态分开记 reason：12153 = refresh token 被判定失效；
+					// 裸 401（APISIX 网关页）= 凭据被拒。面板上的排查方向不同。
+					reason := "401 auth failed (re-login required)"
+					if strings.Contains(ue.Msg, "12153") {
+						reason = "12153 session dead"
+					}
+					if s.cfg.Pool.NoteSessionDeadReason(uid, reason) {
+						log.Printf("balance %s: 连续 %d 次鉴权失败 — 禁用（需重新登录）",
+							logfmt.Label(uid, a.Nickname), pool.SessionDeadThreshold())
+					}
+				}
 				return
 			}
+			// 余额查询成功即证明凭证有效：清连续鉴权失败计数（与 keepalive 同一计数器）。
+			s.cfg.Pool.ClearSessionDead(uid)
 			if expiring > 0 {
 				s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring)
 			} else {

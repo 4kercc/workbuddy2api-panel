@@ -387,3 +387,36 @@ Docker Compose 常驻（`restart: unless-stopped`，宿主 docker 守护进程 `
 
 本项目为非官方网关，README 已明确仅限本人授权账号在私有环境使用。相关自动化会调用上游
 活动接口，账号存在被风控的可能，风险自担。
+
+---
+
+# 变更记录（追加）
+
+## 2026-10-18 · `1.12.5-panel`：401 死号识别
+
+**问题**：3 个 CN 号连续 10 天余额查询返回 `401 Authorization Required`（APISIX 网关 HTML，
+无 `12153` 业务码），但账号池仍报 15/15 可用、首页显示「服务正常」，运维完全看不到。
+
+**根因**：`internal/upstream/client.go` 的 `Classify` 只认 `sessionDeadMarkers`（`12153` /
+`Offline user session not found`）。裸 401 HTML 命中不了任何 marker，一路落到 4xx 兜底
+`ErrClient` → `applyErrorPolicy` 走「只换号不罚」；余额刷新（`RunBalanceRefreshNow`）
+更是只打一行日志、完全不回写池状态。
+
+**改动**：
+- `Classify`：HTTP 401 一律判 `ErrSessionDead`（判在 marker 层之前）
+- `RunBalanceRefreshNow`：`ErrSessionDead` → `NoteSessionDeadReason`（连续 3 次才禁用），
+  查询成功 → `ClearSessionDead` 清零。余额刷新每 5 分钟一次，死号 15 分钟内必被识别
+- `Pool.NoteSessionDeadReason`：新增，允许指定禁用 reason（`NoteSessionDead` 委托给它，
+  12153 行为不变）
+- `applyErrorPolicy`：12153 仍立即禁用；裸 401 改走连续计数（防瞬时抖动误杀）
+- 禁用 reason 区分：`12153 session dead` / `401 auth failed (re-login required)`
+
+**验证**：日志实证这 3 个号的 refresh token 已失效
+（`invalid_grant: Session doesn't have required client`），无法刷新恢复，只能重新登录；
+部署后余额刷新 3 轮内应转为「已禁用」。单元测试：`TestClassify` 新增裸 401 用例；新增
+`TestRunBalanceRefreshMarksAuthFailure` / `TestRunBalanceRefreshClearsAuthFailureCount`。
+
+**部署形态变更**：服务器 `/root/workbuddy2api-panel` 已改为 fork 的正常 clone
+（`origin` = `4kercc/workbuddy2api-panel`，`upstream` = 原 `linguo2625469`，当前分支
+`dev`）。此前服务器上的 fork 成果全是未提交工作树改动，现已全部固化进 git；
+以后部署直接 `git pull && docker compose up -d --build`。

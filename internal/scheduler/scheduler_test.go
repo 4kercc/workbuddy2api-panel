@@ -463,3 +463,74 @@ func TestRunBalanceRefreshNowUpdatesCreditsAndRevives(t *testing.T) {
 		t.Errorf("u2 must stay disabled")
 	}
 }
+
+// TestRunBalanceRefreshMarksAuthFailure 余额刷新是每 5 分钟一次的全量体检，必须
+// 成为死号的检测入口：裸 401（APISIX 网关页，无 12153 文案）此前只打日志、不回写
+// 池状态，导致 3 个 CN 号连续 10 天 401 而面板仍报 15/15 可用（2026-10 线上实测）。
+// 连续 sessionDeadThreshold 次才禁用（防瞬时抖动），reason 需与 12153 区分。
+func TestRunBalanceRefreshMarksAuthFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`<html><head><title>401 Authorization Required</title></head></html>`))
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+
+	for i := 1; i < pool.SessionDeadThreshold(); i++ {
+		s.RunBalanceRefreshNow()
+		if st, _ := p.Status("u1"); st.Disabled {
+			t.Fatalf("第 %d 次 401 不应禁用（连续计数防抖动）", i)
+		}
+	}
+	s.RunBalanceRefreshNow()
+	st, _ := p.Status("u1")
+	if !st.Disabled {
+		t.Fatalf("连续 %d 次 401 应禁用: %+v", pool.SessionDeadThreshold(), st)
+	}
+	if st.DisabledReason != "401 auth failed (re-login required)" {
+		t.Errorf("disabled_reason=%q want 401 auth failed (re-login required)", st.DisabledReason)
+	}
+}
+
+// TestRunBalanceRefreshClearsAuthFailureCount 余额查询成功即证明凭证有效，必须清
+// 连续计数——否则「2 次抖动 + 恢复 + 1 次抖动」会误杀健康账号。
+func TestRunBalanceRefreshClearsAuthFailureCount(t *testing.T) {
+	var fail atomic.Bool
+	fail.Store(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fail.Load() {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`<html><body><h1>401 Authorization Required</h1></body></html>`))
+			return
+		}
+		w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":1000,"CycleCapacityRemain":500,"CycleCapacityUsed":0}]}}}}`))
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+
+	// 失败 2 次（差 1 次到阈值）→ 成功一次清计数 → 再失败 2 次。
+	s.RunBalanceRefreshNow()
+	s.RunBalanceRefreshNow()
+	fail.Store(false)
+	s.RunBalanceRefreshNow()
+	fail.Store(true)
+	s.RunBalanceRefreshNow()
+	s.RunBalanceRefreshNow()
+
+	if st, _ := p.Status("u1"); st.Disabled {
+		t.Fatalf("成功一次后计数应清零，再 2 次失败不应禁用: %+v", st)
+	}
+	// 清零后仍需连续整阈值次才禁用。
+	s.RunBalanceRefreshNow()
+	if st, _ := p.Status("u1"); !st.Disabled {
+		t.Fatalf("清零后再连续 %d 次失败应禁用: %+v", pool.SessionDeadThreshold(), st)
+	}
+}

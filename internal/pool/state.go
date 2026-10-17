@@ -19,7 +19,7 @@ func (p *Pool) Disable(uid, reason string) {
 	}
 }
 
-// NoteSessionDead 记录一次 ErrSessionDead（12153）——**不立即禁用**。
+// NoteSessionDead 记录一次 ErrSessionDead（12153 / 裸 401）——**不立即禁用**。
 // 旧行为一次 12153 即 Disable，但 12153 会被临时性触发（网络抖动/上游闪断/refresh
 // 竞态），一次失败就永久杀号会误杀健康账号（P0-1 侦察：13 个 disabled 号全部 refresh
 // 成功，是历史误判的受害者）。改为连续 sessionDeadThreshold 次才禁用：
@@ -29,6 +29,17 @@ func (p *Pool) Disable(uid, reason string) {
 // 即使账号已 disabled，计数仍累计并返回 false 前 N-1 次——但 keepalive 会跳过
 // disabled 号，实际只有「已 disabled 后复活且计数未清」这类场景才会走到这里。
 func (p *Pool) NoteSessionDead(uid string) bool {
+	return p.NoteSessionDeadReason(uid, sessionDeadReason)
+}
+
+// NoteSessionDeadReason 与 NoteSessionDead 同语义（连续计数，达阈值才禁用），
+// 但允许调用方指定禁用 reason。
+//
+// 需要区分文案的原因：同样判 ErrSessionDead，上游有两种形态——带业务信封的
+// 12153「Offline user session not found」（refresh token 被上游明确判定失效）与
+// APISIX 网关直接回的裸 401 HTML（凭据被拒）。面板/日志上必须能区分二者：前者
+// 说明 refresh 通道已死，后者还要排查是不是 access token 单边失效或网关策略。
+func (p *Pool) NoteSessionDeadReason(uid, reason string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
@@ -40,7 +51,7 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 		return false
 	}
 	e.sessionDeadFails = 0
-	p.disableLocked(e, sessionDeadReason)
+	p.disableLocked(e, reason)
 	return true
 }
 
