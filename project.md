@@ -436,3 +436,56 @@ Docker Compose 常驻（`restart: unless-stopped`，宿主 docker 守护进程 `
 （`origin` = `4kercc/workbuddy2api-panel`，`upstream` = 原 `linguo2625469`，当前分支
 `dev`）。此前服务器上的 fork 成果全是未提交工作树改动，现已全部固化进 git；
 以后部署直接 `git pull && docker compose up -d --build`。
+
+## 2026-10-27 · `dev@735cfc3`：修复 global 账号「假冻结」+ 面板对话测试
+
+**现象**：面板 14 个账号里 11 个被标「已禁用」，reason 全是
+`account banned by upstream (11140 request illegal), re-login required`。但用户发现
+点「签到」这些账号仍能走通上游（返回业务错误 `{"code":10001,"msg":"签到活动未开启或已过期"}`
+而非连接/鉴权失败）——怀疑是**假冻结**。
+
+**排查结论（实测确证为假冻结）**：
+- 11 个「已禁用」账号**全部是 global（国际版）域**；3 个正常账号全部是 cn 域。
+- 容器日志实测：上游返回的是 `{"code":11128,"msg":"request illegal",
+  "displayTips":{"zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。"}}`
+  ——**11128 是「通道校验失败」**（账号健康），与账号级限制 11140 的 msg 文案
+  **完全相同**（都是 "request illegal"）。
+- 旧 `Classify` 只按裸文案 "request illegal" 判定 → 把 11128 通道校验失败误判为
+  `ErrAccountFault` → `applyErrorPolicy` **硬禁用健康账号**。容器日志里 11140 出现 0 次、
+  11128 出现 3 次，reason 串却写死「11140」——reason 本身也是错的。
+
+**一线根因**：上游国际端点收紧通道校验后，**缺 `X-Conversation-ID` 的请求直接
+400/11128**（conversation id missing）。`injectConversationHeaders` 此前只在入站带
+conversationId 时才发该头（「透传优先」），global 请求因此稳定被拦——3/3 复现。
+
+**改动**（吸收上游权威修复 thrasher824 PR #233 / commit `7a8b7a7`）：
+- `internal/upstream/client.go`：新增 `ErrChannelRefused`；`Classify` 按**业务码**分流
+  ——`isChannelRefused`（11128+文案）→ `ErrChannelRefused`；`IsAccountRestricted`
+  （11140+文案）→ `ErrAccountFault`；`accountFaultMarkers` 移除裸 "request illegal"。
+- `internal/upstream/headers.go`：`injectConversationHeaders` **始终发送**
+  `X-Conversation-ID`，入站未带时补 32 hex（一线根因修复）。
+- `internal/server/handler.go`：`ErrAccountFault` 改用 `IsAccountRestricted`；新增
+  `case ErrChannelRefused`（零动作，不罚账号）；`hint.go` 补排查指引。
+- 回归测试：`client_test.go` / `handler_test.go` / `headers_test.go`（会话头 wire-level）。
+
+**新增能力**（本 fork）：面板账号卡片新增「对话」按钮 + `POST /panel/api/accounts/{uid}/chat`
+——用指定账号直连上游真实发一次 chat，聚合 SSE 回回复。用于**分辨真封禁/假封禁**：
+能出回复 = 账号健康（假封禁，点「解冻」即可）；401/12153 = 凭证失效（真封禁）。
+- `internal/panel/chat.go`（新增）：`accountChat` 处理器。
+- `internal/panel/{panel.go,app.js,index.html}`：路由注册 + 行按钮 + 结果弹窗。
+
+**验证（线上实测）**：
+
+| 项 | 结果 |
+|---|---|
+| 修复前 global 账号对话 | 3/3 稳定 11128 |
+| 修复后 global 账号对话 | 11/11 HTTP 200 + 真实回复 |
+| 全量解冻后 `/healthz` | `healthy:14 total:14`，`realm_servable:{cn:true,global:true}` |
+| `/v1/chat/completions` 端到端 | 200，正常返回 |
+| `go vet ./...` / `go test ./...` | 全通过 |
+
+**运维动作**：11 个被误禁的 global 账号已通过 `POST /panel/api/accounts/{uid}/revive`
+全部解冻（`{ok:true}` ×11），池恢复 14/14 可用。
+
+**回滚**：`git reset --hard e7b561d && docker compose up -d --build`（回退到本次改动前）。
+
