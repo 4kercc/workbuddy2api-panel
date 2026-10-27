@@ -489,3 +489,46 @@ conversationId 时才发该头（「透传优先」），global 请求因此稳�
 
 **回滚**：`git reset --hard e7b561d && docker compose up -d --build`（回退到本次改动前）。
 
+## 2026-10-27 · `dev@8aa0924`：首页「导出配置」（账号凭证 + config.json 单文件备份）
+
+**需求**：首页加一个配置导出功能，方便迁移数据（换服务器 / 重建部署免重新走 OAuth）。
+
+**设计**：
+- `GET /panel/api/export` → 单个 JSON 下载（`Content-Disposition: attachment;
+  filename="wb2api-backup-<时间>.json"`），结构：
+  `{app, version, exported_at, accounts:[嵌套形 auth 文档…], config:{config.json 内容}}`。
+- **accounts 直接读 AuthDir 下的 `workbuddy-*.json`**（而非读内存）：盘上文件是
+  `SaveAtomic` 的原子一致快照，避免与 `RefreshToken` 并发改写 token 字段的撕裂读——
+  `AccessToken / RefreshToken / ExpiresAt` 三个字段无法在一次加锁内一并取出（sync.Mutex
+  不可重入，逐个 accessor 取值可能跨一次刷新，出现「新 accessToken + 旧 refreshToken」
+  的坏快照）。逐字就是导入侧期望的格式，往返无损。
+- **迁移闭环**：`parseAuthBlob` 新增第三种形态识别——备份包 `{"accounts":[…]}`（抽出
+  `parseAuthItems` 复用数组分支）。导出文件因此可直接经「添加账号 → 本地部署导入」
+  重新导入，无需手工拆包。
+
+**改动清单**：
+
+| 文件 | 类型 | 说明 |
+|---|---|---|
+| `internal/panel/export.go` | 新增 | `exportConfig` 处理器 + `readAuthDocs` |
+| `internal/panel/export_test.go` | 新增 | 3 个测试（备份包解析 / 导出端到端+往返 / 401） |
+| `internal/panel/import_auths.go` | 修改 | `parseAuthBlob` 支持备份包；抽出 `parseAuthItems` |
+| `internal/panel/panel.go` | 修改 | 注册 `GET /panel/api/export` |
+| `internal/panel/index.html` | 修改 | 顶栏「导出配置」按钮 |
+| `internal/panel/app.js` | 修改 | 下载交互（原生 fetch + blob，保留服务端文件名） |
+
+**验证**：
+
+| 项 | 结果 |
+|---|---|
+| `go test ./internal/panel/`（含 3 个新测试） | 通过 |
+| `go vet ./...` / `go test ./...` | 全通过 |
+| 线上 `GET /panel/api/export` | 200 + `Content-Disposition: attachment; filename="wb2api-backup-20261027-233309.json"` |
+| 线上导出内容 | `accounts` 14 条 + `config` 段齐全 |
+| 面板 UI | 顶栏「导出配置」按钮已就位 |
+
+**安全提示**：导出文件含 `accessToken` / `refreshToken`（等同账号密码），只应保存在可信位置。
+
+**回滚**：`git reset --hard 5574f59 && docker compose up -d --build`。
+
+
