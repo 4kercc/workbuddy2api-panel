@@ -218,6 +218,7 @@ function renderAccounts(list) {
       '<td class="acts">' +
         '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '">签到</button>' +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
+        '<button class="xs ghost" data-a="chat" data-u="' + esc(s.uid) + '">对话</button>' +
         '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
@@ -280,6 +281,8 @@ $('accBody').addEventListener('click', async ev => {
     } else if (a === 'balance') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/balance', { method: 'POST' });
       toast('余额已更新：' + r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : ''), 'ok');
+    } else if (a === 'chat') {
+      openChat(u);
     } else if (a === 'revive') {
       await api('accounts/' + encodeURIComponent(u) + '/revive', { method: 'POST' });
       toast('已解冻', 'ok');
@@ -855,6 +858,51 @@ function openTasks(uid) {
 function closeTasks() { $('taskVeil').classList.remove('on'); taskUID = null; }
 $('btnCloseTask').onclick = closeTasks;
 $('btnTaskReload').onclick = loadTasks;
+
+/* ── 对话测试：真实调用上游 chat，分辨账号「真封禁 / 假封禁」─────────────── */
+// 用途：账号被标「已禁用」时，点「对话」实测一次。能出回复 = 账号健康（假封禁，
+// 点「解冻」即可恢复）；返回 401/12153 = 凭证失效（真封禁，需重走 OAuth）。
+let chatUID = null;
+function openChat(uid) {
+  chatUID = uid;
+  $('chatWho').textContent = uid.slice(0, 16);
+  $('chatMeta').textContent = '';
+  $('chatVeil').classList.add('on');
+  runChat();
+}
+function closeChat() { $('chatVeil').classList.remove('on'); chatUID = null; }
+$('btnChatClose').onclick = closeChat;
+$('btnChatRetry').onclick = runChat;
+
+// runChat 执行一次对话测试并渲染结果（成功绿、失败红 + 上游原文 + 分类）。
+async function runChat() {
+  if (!chatUID) return;
+  const st = $('chatState'), box = $('chatResult');
+  st.hidden = false; st.className = 'state';
+  st.innerHTML = '<span class="dots">调用上游中（真实 chat，约 2-10 秒）</span>';
+  box.hidden = true; box.innerHTML = '';
+  try {
+    const r = await api('accounts/' + encodeURIComponent(chatUID) + '/chat', { method: 'POST' });
+    st.hidden = true;
+    box.hidden = false;
+    $('chatMeta').textContent = (r.model || '') + ' · ' + (r.elapsed_ms != null ? r.elapsed_ms + 'ms' : '');
+    if (r.ok) {
+      box.innerHTML =
+        '<div class="state" style="color:var(--ok,#16a34a);margin-bottom:8px">✅ 对话成功 —— 账号健康，可正常调用上游</div>' +
+        '<div style="white-space:pre-wrap;word-break:break-word;background:var(--bg-2,#0f1420);border:1px solid var(--line,#243);border-radius:8px;padding:10px;max-height:340px;overflow:auto">' +
+        esc(r.reply || '（空回复）') + '</div>';
+    } else {
+      box.innerHTML =
+        '<div class="state" style="color:var(--bad,#dc2626);margin-bottom:8px">❌ 对话失败 —— HTTP ' + esc(String(r.status || '?')) +
+        (r.kind ? '（' + esc(r.kind) + '）' : '') + '</div>' +
+        '<div style="white-space:pre-wrap;word-break:break-word;background:var(--bg-2,#0f1420);border:1px solid var(--line,#243);border-radius:8px;padding:10px;max-height:340px;overflow:auto;font-size:12px">' +
+        esc(r.error || '（无上游原文）') + '</div>';
+    }
+  } catch (e) {
+    st.hidden = true; box.hidden = false;
+    box.innerHTML = '<div class="state" style="color:var(--bad,#dc2626)">请求失败：' + esc(e.message) + '</div>';
+  }
+}
 
 // 全部接受：把该账号未接受的任务一次性报名（幂等，跳过已接受/已领取）。
 $('btnTaskAcceptAll').onclick = async () => {

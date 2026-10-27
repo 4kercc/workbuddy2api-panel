@@ -894,6 +894,26 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   </div>
 </div>
 
+<!-- 对话测试：真实调用上游 chat，用于分辨账号「真封禁 / 假封禁」 -->
+<div class="veil" id="chatVeil">
+  <div class="dlg" style="width:720px">
+    <header>
+      <h3>对话测试 <span class="hint" id="chatWho"></span></h3>
+      <div class="hint">用该账号真实发一次 chat 请求（直连上游，与 /v1 同链路）。能出回复 = 账号健康；返回 401/12153 = 凭证失效需重登。</div>
+    </header>
+    <div class="body">
+      <div class="state" id="chatState"><span class="dots">调用中</span></div>
+      <div id="chatResult" hidden></div>
+    </div>
+    <footer>
+      <span class="hint" id="chatMeta"></span>
+      <span class="grow"></span>
+      <button id="btnChatRetry">再测一次</button>
+      <button class="primary" id="btnChatClose">关闭</button>
+    </footer>
+  </div>
+</div>
+
 <!-- 开学季券码 -->
 <div class="veil" id="vcVeil">
   <div class="dlg">

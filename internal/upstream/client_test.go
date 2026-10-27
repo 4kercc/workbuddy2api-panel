@@ -41,6 +41,14 @@ func TestClassify(t *testing.T) {
 		{400, `Illegal API invocation from an unapproved channel`, ErrContentBlocked},
 		{400, `{"code":11128,"msg":"blocked by security policy"}`, ErrContentBlocked},
 		{400, `unapproved channel`, ErrContentBlocked},
+		// 11128 反探测/内容拦截的 "request illegal" 变体（生产实测原文）：与
+		// accountFaultMarkers 的同名文案撞车，必须先于 accountFault 判为内容拦截，
+		// 否则健康账号被误判为账号封禁 → 硬禁用（2026-10 假冻结事故根因）。
+		{400, `{"code":11128,"msg":"request illegal","requestId":"10eda982dcee69b26c1617a348d0ea8d","displayMsg":{"en":"Request blocked. Please send it again","zh":"请求被拦截，请重新发送","zh-hant":"請重新傳送"}}`, ErrContentBlocked},
+		{400, `{"error":{"data":{"code":11128,"msg":"request illegal"}}}`, ErrContentBlocked},
+		// 对照：真账号封禁 11140 "request illegal" 仍归 ErrAccountFault（不得被上面的
+		// 11128 预判顺带放行）。
+		{403, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
 		// 通用 4xx（非审核文案）：仍判 ErrClient，只换号不罚。
 		{400, `bad request`, ErrClient},
 		// ErrBadParams：请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）。

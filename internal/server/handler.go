@@ -1070,7 +1070,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		//   - 14017（trial not activated）→ register 未完成，补完 register 后可能自愈，
 		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
 		// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
-		if strings.Contains(strings.ToLower(body), "request illegal") {
+		//
+		// 防御性二次判定：11128 反探测/内容拦截**同样**用 "request illegal" 文案
+		// （displayMsg「请重新发送」），Classify 已把 11128 分流到 ErrContentBlocked，
+		// 正常到不了本分支；此处再挡一道——即便分类被绕过也绝不禁用健康账号
+		// （2026-10 假冻结事故：11 个健康账号被 11128 误禁）。
+		if strings.Contains(strings.ToLower(body), "request illegal") && !upstream.IsAntiProbeBlock(body) {
 			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
 			return
 		}

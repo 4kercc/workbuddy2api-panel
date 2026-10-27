@@ -133,6 +133,11 @@ var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 // is rate-limiting requests."），那种场景必须保持 ErrSoftRate（下方 softRateMarkers
 // 后判定）。故此处只收 msg 关键词 "request illegal"（auth_forbidden 的真实文案）。
 // 14017 文案唯一（无软限流歧义），可安全收录。
+//
+// ⚠️ 陷阱：**11128 也用 "request illegal" 文案**（反探测/内容拦截，displayMsg
+// 「请重新发送」），那是请求级可重试拦截、不是账号封禁。Classify 已在进入本层前
+// 用 antiProbeBlockCode 把 11128 分流到 ErrContentBlocked——本 marker 只对**非
+// 11128** 的 "request illegal" 生效（见 Classify 内 11128 预判）。
 var accountFaultMarkers = []string{
 	"request illegal",
 	"trial not activated",
@@ -322,6 +327,23 @@ func hasBusinessCode(body, want string) bool {
 	return walk(root)
 }
 
+// antiProbeBlockCode 上游「反探测 / 内容拦截」业务码。同一 code 承载两种 msg 文案：
+//   - "blocked by security policy"（内容审核逐字误杀，issue #36/PR39）
+//   - "request illegal"（反探测命中，displayMsg「请求被拦截，请重新发送 /
+//     Request blocked. Please send it again」）
+//
+// 两者语义都是**请求级、可重试**（重新发送即可），**绝非账号级封禁**——账号余额、
+// session、鉴权全部健康。故必须在 accountFaultMarkers 之前判定：否则 "request illegal"
+// 变体会命中该层的同名字符串被误判为 ErrAccountFault，进而在 applyErrorPolicy 里
+// 硬禁用健康账号（2026-10 生产事故：11 个健康账号被 11128 误禁为「已禁用」，
+// 面板签到/余额/对话实测全部正常——即用户观察到的「假冻结」）。
+const antiProbeBlockCode = "11128"
+
+// IsAntiProbeBlock 报告 body 是否为上游反探测/内容拦截码 11128 的响应（请求级可重试，
+// 不是账号封禁）。供 server 侧 applyErrorPolicy 做防御性二次判定（分类已收口，
+// 此函数保证即使分类被绕过也不会把 11128 误判为账号封禁）。
+func IsAntiProbeBlock(body string) bool { return hasBusinessCode(body, antiProbeBlockCode) }
+
 // hasBusinessEnvelope 报告错误 body 是否携带上游业务信封形态（JSON 且含
 // `"code":` 或 `"msg":` 字段）。WAF 403 判定（IsWafBlocked）用「无业务信封」
 // 区分 APISIX WAF 拦截页（HTML/空体/纯文本）与上游业务层 403（带 code/msg
@@ -507,6 +529,13 @@ func Classify(status int, body string) ErrKind {
 		if strings.Contains(body, m) {
 			return ErrSessionDead
 		}
+	}
+	// 11128（反探测/内容拦截，msg 可为 "request illegal" 或 "blocked by security policy"）
+	// 必须先于 accountFaultMarkers 判定：它与账号级 auth 风控**共用 "request illegal"
+	// 文案**，若落到下层会被误判为 ErrAccountFault → 硬禁用健康账号（假冻结根因）。
+	// 归 ErrContentBlocked：不罚账号，passthrough/append 首遇触发降级重试，最终仍拦回 400。
+	if hasBusinessCode(body, antiProbeBlockCode) {
+		return ErrContentBlocked
 	}
 	for _, m := range accountFaultMarkers {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
