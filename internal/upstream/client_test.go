@@ -30,6 +30,17 @@ func TestClassify(t *testing.T) {
 		// 限流文案（issue #28）：状态码不是 429 时也必须识别为软限流，
 		// 否则账号不会被冷却，下次请求仍会被选中。
 		{200, `{"code":11140,"msg":"The model provider is rate-limiting requests. Please wait a moment and try again."}`, ErrSoftRate},
+		// 11128 与 11140 的 msg 同为 "request illegal"，必须按业务码分流：
+		//   11128 = 通道校验失败（上游认为不是官方客户端发出），账号健康 → 不罚号。
+		//   11140 = 账号被上游限制（异常行为/风控）→ account_fault。
+		// 只看文案会把健康账号误禁用，只按 code 会把 11140 的限流变体误判。
+		{400, `{"code":11128,"msg":"request illegal","displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client."}}`, ErrChannelRefused},
+		{403, `{"code":11128,"msg":"request illegal"}`, ErrChannelRefused},
+		{400, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
+		{403, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
+		// 无 code 的裸 "request illegal" 不归属任何账号级判定（宁可走通用 4xx 兜底，
+		// 也不能凭一句文案硬禁用账号）。
+		{400, `{"msg":"request illegal"}`, ErrClient},
 		{400, `rate limit`, ErrSoftRate},
 		{403, `usage limit reached`, ErrSoftRate},
 		// "model usage limit exceeded" 不是余额语义（无 credit/quota/积分/额度 等计费词），
@@ -42,12 +53,11 @@ func TestClassify(t *testing.T) {
 		{400, `{"code":11128,"msg":"blocked by security policy"}`, ErrContentBlocked},
 		{400, `unapproved channel`, ErrContentBlocked},
 		// 11128 反探测/内容拦截的 "request illegal" 变体（生产实测原文）：与
-		// accountFaultMarkers 的同名文案撞车，必须先于 accountFault 判为内容拦截，
-		// 否则健康账号被误判为账号封禁 → 硬禁用（2026-10 假冻结事故根因）。
-		{400, `{"code":11128,"msg":"request illegal","requestId":"10eda982dcee69b26c1617a348d0ea8d","displayMsg":{"en":"Request blocked. Please send it again","zh":"请求被拦截，请重新发送","zh-hant":"請重新傳送"}}`, ErrContentBlocked},
-		{400, `{"error":{"data":{"code":11128,"msg":"request illegal"}}}`, ErrContentBlocked},
-		// 对照：真账号封禁 11140 "request illegal" 仍归 ErrAccountFault（不得被上面的
-		// 11128 预判顺带放行）。
+		// 11140 的同名文案撞车，按业务码分流到 ErrChannelRefused（通道校验失败，
+		// 账号健康、不罚号）。误判成 account_fault 会硬禁用健康账号（假冻结根因）。
+		{400, `{"code":11128,"msg":"request illegal","requestId":"10eda982dcee69b26c1617a348d0ea8d","displayMsg":{"en":"Request blocked. Please send it again","zh":"请求被拦截，请重新发送","zh-hant":"請重新傳送"}}`, ErrChannelRefused},
+		{400, `{"error":{"data":{"code":11128,"msg":"request illegal"}}}`, ErrChannelRefused},
+		// 对照：真账号限制 11140 "request illegal" 仍归 ErrAccountFault。
 		{403, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
 		// 通用 4xx（非审核文案）：仍判 ErrClient，只换号不罚。
 		{400, `bad request`, ErrClient},
