@@ -784,6 +784,31 @@ $('authsDir').onchange = () => {
 
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */
 $('btnAdd').onclick = openAdd;
+// 导出配置：GET /panel/api/export → 浏览器落盘为 wb2api-backup-<时间>.json。
+// 走原生 fetch（非 api() 助手——后者固定按 JSON 解析），保留服务端 Content-Disposition 文件名。
+$('btnExport').onclick = async () => {
+  const b = $('btnExport');
+  b.disabled = true; b.textContent = '导出中…';
+  try {
+    const h = {};
+    const k = localStorage.getItem(LS_KEY);
+    if (k) h['Authorization'] = 'Bearer ' + k;
+    const r = await fetch('/panel/api/export', { headers: h });
+    if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
+    if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || ('HTTP ' + r.status)); }
+    const blob = await r.blob();
+    let fname = 'wb2api-backup.json';
+    const m = (r.headers.get('Content-Disposition') || '').match(/filename="?([^"]+)"?/);
+    if (m) fname = m[1];
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = fname;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast('已导出 ' + fname + '（含账号凭证，请妥善保管）', 'ok');
+  } catch (e) { toast('导出失败：' + e.message, 'err'); }
+  finally { b.disabled = false; b.textContent = '导出配置'; }
+};
 $('btnRefresh').onclick = async () => {
   const b = $('btnRefresh');
   b.disabled = true; b.textContent = '刷新中…';

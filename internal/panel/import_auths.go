@@ -92,10 +92,11 @@ func (p *Panel) importAuths(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// parseAuthBlob 从一个上传文件的内容里解析账号，自动识别两种形态：
+// parseAuthBlob 从一个上传文件的内容里解析账号，自动识别三种形态：
 //
 //	单个 auth 对象：{"auth":{...},"account":{...}}（嵌套形）或 {"accessToken":...}（扁平形）
 //	auth 对象数组：[{...},{...}]（数组里单个元素坏了不废掉整批）
+//	备份包：{"accounts":[{...},...], "config":{...}}（本面板「导出配置」产物，见 export.go）
 //
 // 解析不出任何账号时返回 error，调用方据此按"非凭证文件"静默跳过。
 // 形态识别复用 auth.Parse，两条导入路径对文件格式的口径因此只有一份。
@@ -110,16 +111,19 @@ func parseAuthBlob(raw []byte) ([]*auth.Auth, error) {
 		if err := json.Unmarshal(trimmed, &items); err != nil {
 			return nil, fmt.Errorf("invalid json array: %w", err)
 		}
-		var out []*auth.Auth
-		for _, it := range items {
-			if a, err := auth.Parse(it); err == nil {
-				out = append(out, a)
-			}
+		return parseAuthItems(items, "array")
+	}
+
+	if trimmed[0] == '{' {
+		// 备份包（本面板「导出配置」产物）：{"accounts":[...], "config":{...}}。
+		// 只认 accounts 为非空数组的形态；单个 auth 对象（无 accounts 键）解析后
+		// Accounts 为 nil，自然落到下方单对象解析，不会误判。
+		var probe struct {
+			Accounts []json.RawMessage `json:"accounts"`
 		}
-		if len(out) == 0 {
-			return nil, fmt.Errorf("no valid account in array")
+		if err := json.Unmarshal(trimmed, &probe); err == nil && len(probe.Accounts) > 0 {
+			return parseAuthItems(probe.Accounts, "bundle")
 		}
-		return out, nil
 	}
 
 	a, err := auth.Parse(trimmed)
@@ -127,4 +131,19 @@ func parseAuthBlob(raw []byte) ([]*auth.Auth, error) {
 		return nil, err
 	}
 	return []*auth.Auth{a}, nil
+}
+
+// parseAuthItems 逐元素 auth.Parse，单个坏元素跳过（不废掉整批）；全坏则报错，
+// 调用方据此按"非凭证文件"静默跳过。what 仅用于错误文案（array / bundle）。
+func parseAuthItems(items []json.RawMessage, what string) ([]*auth.Auth, error) {
+	var out []*auth.Auth
+	for _, it := range items {
+		if a, err := auth.Parse(it); err == nil {
+			out = append(out, a)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no valid account in %s", what)
+	}
+	return out, nil
 }
