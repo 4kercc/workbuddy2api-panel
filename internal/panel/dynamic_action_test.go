@@ -132,3 +132,67 @@ func TestGrowthRunnableSplitsDisplayFromExecution(t *testing.T) {
 		t.Error("已领取任务两个口径都应为 false")
 	}
 }
+
+// TestExpertIDFromTask 从 jump_url 取权威 expertId。
+//
+// 这个字段是「体验某专家」类任务能否真正计数的关键：任务文案里的名字不唯一
+// （搜「抖音策略师」返回 4 个同名专家），只有 jump_url 里的 ID 是上游指定的目标。
+// 用例取自 2026-10-30 线上真实 jump_url。
+func TestExpertIDFromTask(t *testing.T) {
+	cases := []struct {
+		label string
+		url   string
+		want  string
+	}{
+		{
+			label: "真实形态（外层 launch + urlencoded deeplink）",
+			url:   "https://www.workbuddy.cn/work/launch/?deeplink=workbuddy%3A%2F%2Fexperts%3FexpertId%3Dex_FbY5nlWTqDod&buddy_type=workbuddy",
+			want:  "ex_FbY5nlWTqDod",
+		},
+		{label: "已解码形态", url: "workbuddy://experts?expertId=ex_GDl31WahyIH0", want: "ex_GDl31WahyIH0"},
+		{label: "带后续参数", url: "workbuddy://experts?expertId=ex_Weo3x2EZuSDm&from=task", want: "ex_Weo3x2EZuSDm"},
+		{label: "无 expertId（Expert_lighthouse 形态）", url: "https://cloud.tencent.com/act/pro/workbuddy-lighthouse", want: ""},
+		{label: "裸协议无查询串", url: "workbuddy://expert", want: ""},
+		{label: "空", url: "", want: ""},
+	}
+	for _, c := range cases {
+		got := expertIDFromTask(upstream.Task{JumpURL: c.url})
+		if got != c.want {
+			t.Errorf("%s: expertIDFromTask=%q want %q", c.label, got, c.want)
+		}
+	}
+}
+
+// TestMatchExpertsByName 同名专家必须全部返回，让调用方看出「不唯一」。
+// 实测搜「抖音策略师」会返回 4 个命中——只取第一个会召唤到错的实例。
+func TestMatchExpertsByName(t *testing.T) {
+	experts := []upstream.MarketExpert{
+		{ExpertID: "ex_A", DisplayNameZH: "短剧全域内容策略师", ProfessionZH: "短剧全域内容策略师"},
+		{ExpertID: "ex_B", DisplayNameZH: "抖音策略师", ProfessionZH: "抖音短视频与直播电商策略专家"},
+		{ExpertID: "ex_C", DisplayNameZH: "斗音音", ProfessionZH: "抖音策略师"},
+		{ExpertID: "ex_D", DisplayNameZH: "抖音策略师", ProfessionZH: "抖音内容策略顾问"},
+	}
+	hits := matchExpertsByName(experts, "抖音策略师")
+	if len(hits) != 3 {
+		t.Fatalf("命中数=%d want 3（display 或 profession 任一等于即命中）", len(hits))
+	}
+	if len(matchExpertsByName(experts, "不存在的专家")) != 0 {
+		t.Error("不存在的名字不应命中")
+	}
+}
+
+// TestResolveActionCarriesExpertID 动态动作必须把 jump_url 里的 expertId 带进去——
+// 不带就退化成按名匹配，会撞上同名专家。
+func TestResolveActionCarriesExpertID(t *testing.T) {
+	act := resolveAction(upstream.Task{
+		TaskCode: "expert_use_douyinyin",
+		TaskDesc: "在专家页搜索并召唤「抖音策略师」，完成一次对话。",
+		JumpURL:  "https://www.workbuddy.cn/work/launch/?deeplink=workbuddy%3A%2F%2Fexperts%3FexpertId%3Dex_FbY5nlWTqDod&buddy_type=workbuddy",
+	})
+	if act == nil {
+		t.Fatal("应动态适配出动作")
+	}
+	if !strings.Contains(act.Desc, "ex_FbY5nlWTqDod") {
+		t.Errorf("Desc 应带权威 expertId：%q", act.Desc)
+	}
+}

@@ -28,6 +28,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -1069,35 +1070,88 @@ func summonExpertOnce(p *Panel, a *auth.Auth, e upstream.MarketExpert) error {
 	return nil
 }
 
-// matchExpertByName 在搜索结果里按名字精确匹配专家。
-// display_name_zh 与 profession_zh 都要看——实测「商家宣传页与海报设计师」的
-// display_name_zh 是「商家宣传设计师」，profession_zh 才是任务文案里那个名字。
-func matchExpertByName(experts []upstream.MarketExpert, name string) (upstream.MarketExpert, bool) {
+// matchExpertsByName 名字精确匹配（display_name_zh 或 profession_zh），返回**全部**命中。
+// 返回全部而不是首个：同名专家很常见，调用方必须能看出「不唯一」并拒绝执行。
+func matchExpertsByName(experts []upstream.MarketExpert, name string) []upstream.MarketExpert {
+	var out []upstream.MarketExpert
 	for _, e := range experts {
 		if e.DisplayNameZH == name || e.ProfessionZH == name {
-			return e, true
+			out = append(out, e)
 		}
 	}
-	return upstream.MarketExpert{}, false
+	return out
 }
 
-// runExpertNamed 按名字在专家市场搜到该专家并完成一次召唤+使用链（L2 动态适配执行端）。
+// runExpertTask 完成一次「体验某专家」类任务：确定目标专家 → 召唤链 → 真实对话 → 使用事件。
 //
-// 搜不到精确命中就**直接报错返回**，不猜、不换人：把一个错误的专家召唤了既浪费积分
-// 又可能点亮别的任务，报错让人工介入更诚实。
-func runExpertNamed(p *Panel, a *auth.Auth, name string) (string, error) {
-	experts, err := p.cfg.Upstream.MarketExpertSearch(a, "agent", name)
-	if err != nil {
-		return "", fmt.Errorf("搜索专家「%s」: %w", name, err)
+// 目标专家的确定顺序（expertId 权威优先）：
+//  1. expertID 非空（来自任务 jump_url）→ 直接用它，市场搜索只为补齐 version/categories
+//     等事件载荷字段，搜不到也用最小记录继续（ID 是上游自己给的，不需要猜）。
+//  2. expertID 为空 → 按名字搜市场，**要求唯一精确命中**；命中多个时拒绝执行并报错。
+//
+// 为什么不能只按名字取第一个：任务文案里的名字**不唯一**。实测搜「抖音策略师」返回 4 个
+// display_name_zh 或 profession_zh 都叫这个名字的专家，按名字取首个会召唤到别的实例
+// ——事件发出去了但任务不计数（2026-10-30 实测：召唤 ex_loEfkMTwHi8v 后 progress 仍 0/1，
+// 而任务 jump_url 指向的是 ex_FbY5nlWTqDod）。召唤错的专家既浪费额度又可能点亮别的任务。
+func runExpertTask(p *Panel, a *auth.Auth, name, expertID string) (string, error) {
+	e := upstream.MarketExpert{ExpertID: expertID, DisplayNameZH: name, ProfessionZH: name, ExpertType: "agent"}
+	experts, serr := p.cfg.Upstream.MarketExpertSearch(a, "agent", name)
+	if expertID != "" {
+		for _, x := range experts {
+			if x.ExpertID == expertID {
+				e = x
+				break
+			}
+		}
+	} else {
+		if serr != nil {
+			return "", fmt.Errorf("搜索专家「%s」: %w", name, serr)
+		}
+		hits := matchExpertsByName(experts, name)
+		switch {
+		case len(hits) == 0:
+			return "", fmt.Errorf("专家市场无精确匹配「%s」（搜索返回 %d 条，不猜不换人）", name, len(experts))
+		case len(hits) > 1:
+			return "", fmt.Errorf("专家市场有 %d 个同名「%s」，任务未给 expertId 无法确定目标", len(hits), name)
+		}
+		e = hits[0]
 	}
-	e, ok := matchExpertByName(experts, name)
-	if !ok {
-		return "", fmt.Errorf("专家市场无精确匹配「%s」（搜索返回 %d 条，不猜不换人）", name, len(experts))
+	if e.ExpertID == "" {
+		return "", fmt.Errorf("无法确定要召唤的专家（name=%q expertId=%q）", name, expertID)
 	}
 	if err := summonExpertOnce(p, a, e); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("动态适配：已召唤「%s」(%s) 并完成一次真实对话", e.DisplayNameZH, e.ExpertID), nil
+}
+
+// expertIDFromTask 从任务 jump_url 里取**权威**的 expertId。
+//
+// jump_url 形如（外层是 launch 跳转，deeplink 里才是真实协议）：
+//
+//	https://www.workbuddy.cn/work/launch/?deeplink=workbuddy%3A%2F%2Fexperts%3FexpertId%3Dex_XXX
+//
+// 先整体 URL 解码再取 expertId= 之后到非标识符字符为止。取不到返回空串
+// （如 Expert_lighthouse / WorkBuddy_Valorant 就没有，走名字匹配兜底）。
+func expertIDFromTask(t upstream.Task) string {
+	s := t.JumpURL
+	if u, err := url.QueryUnescape(s); err == nil {
+		s = u
+	}
+	const key = "expertId="
+	i := strings.Index(s, key)
+	if i < 0 {
+		return ""
+	}
+	rest := s[i+len(key):]
+	for j, r := range rest {
+		if r == '_' || r == '-' ||
+			(r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			continue
+		}
+		return rest[:j]
+	}
+	return rest
 }
 
 // betweenBrackets 取 s 中 verb 之后紧跟的「...」内容（verb 与「之间零字符）。
@@ -1154,11 +1208,16 @@ func resolveAction(t upstream.Task) *autoAction {
 	if name == "" {
 		return nil
 	}
+	id := expertIDFromTask(t)
+	target := "「" + name + "」"
+	if id != "" {
+		target += "(" + id + ")"
+	}
 	return &autoAction{
 		TaskCode: t.TaskCode,
-		Desc:     "动态适配（专家类）：搜索并召唤「" + name + "」+ 真实对话",
+		Desc:     "动态适配（专家类）：召唤 " + target + " + 真实对话",
 		run: func(p *Panel, a *auth.Auth) (string, error) {
-			return runExpertNamed(p, a, name)
+			return runExpertTask(p, a, name, id)
 		},
 	}
 }
