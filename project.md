@@ -654,3 +654,47 @@ market/expert/list` 支持 `keyword` 参数，实测 6/6 专家可按名命中�
 
 **实测上游窗口**：`start_at=2026-09-13 00:00:00`、`end_at=2026-09-24 23:59:59`、
 `in_period=False`。
+
+### 2026-10-30 修正：按名字匹配会召唤错专家（已修，实测通过）
+
+**踩坑**：L2 首版按名字在专家市场里取**第一个**精确命中，实测召唤了 `ex_loEfkMTwHi8v`
+并跑完召唤链+真实对话，但 `progress` 仍 `0/1`——**任务不计数**。
+
+**根因**：任务文案里的专家名**不唯一**。搜「抖音策略师」返回 4 个
+`display_name_zh` 或 `profession_zh` 都叫这个名字的专家：
+
+| expert_id | display_name_zh | profession_zh |
+|---|---|---|
+| `ex_loEfkMTwHi8v` | 抖音策略师 | 抖音短视频与直播电商策略专家 |
+| `ex_lKRHiHEbYoHL` | 抖音策略师 | 抖音内容策略顾问 |
+| `ex_WmcyDlsTPaiS` | 抖音策略师 | 抖音全域增长策略师 |
+| **`ex_FbY5nlWTqDod`** | **斗音音** | **抖音策略师** ← 任务真正指向的 |
+
+而任务的 `jump_url` 里带着**权威 expertId**：
+
+```
+https://www.workbuddy.cn/work/launch/?deeplink=workbuddy%3A%2F%2Fexperts%3FexpertId%3Dex_FbY5nlWTqDod
+```
+
+**修复**：
+- 新增 `expertIDFromTask()`：整体 URL 解码后取 `expertId=` 到非标识符字符
+- `runExpertTask()`：**expertId 优先**（市场搜索只为补齐 version/categories，搜不到也用
+  最小记录继续——ID 是上游自己给的）；无 ID 时按名字匹配且**要求唯一**，命中多个直接
+  报错拒绝执行
+- `matchExpertsByName()` 返回全部命中（原 `matchExpertByName` 取首个，已删除）
+
+**实测覆盖**：4/5 个目标任务的 `jump_url` 带 expertId（`expert_use_maidehao` /
+`douyinyin` / `shangjia_xuanchuan` / `bowangwang`）；`WorkBuddy_Valorant` 与
+`Expert_lighthouse` 没有，走名字唯一匹配兜底。
+
+**端到端实测（2026-10-30，账号 2cfe9ae1）**：
+
+```
+expert_use_douyinyin  0/1 → 1/1  已召唤「斗音音」(ex_FbY5nlWTqDod)   自动领奖 +50 分 +5 能
+WorkBuddy_Valorant    0/1 → 1/1  已召唤「无畏契约拼豆专家」(ex_xQHHD1u5Jkua) 自动领奖 +100 分 +5 能
+```
+
+两条路径（权威 ID / 名字唯一匹配）均实测通过，共 +150 积分 +10 能量。
+
+**教训**：上游文案里的「名字」是给人看的，不能当主键；能用 ID 就用 ID，用名字时必须
+要求唯一，宁可报错也不猜。
