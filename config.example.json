@@ -21,6 +21,8 @@
     "blackcat_enabled": true,
     "balance_refresh_enabled": true,
     "balance_refresh_minutes": 5,
+    "task_sweep_enabled": true,
+    "task_sweep_minutes": 15,
     "task_auto_enabled": false,
     "task_auto_concurrency": 1
   },
@@ -71,7 +73,8 @@
     "idle_weight_per_hour": 0.5,
     "idle_weight_max": 5.0,
     "expiring_soon": "168h",
-    "cost_explore_interval": "30m"
+    "cost_explore_interval": "30m",
+    "reserve_credits": 10
   },
   "session_sticky": {
     "enabled": true,

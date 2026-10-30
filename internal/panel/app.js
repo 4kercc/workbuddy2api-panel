@@ -172,6 +172,9 @@ function renderAccounts(list) {
         : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
+    /* 保留积分停牌：账号状态机是健康的（所以显示「可用」），但余额已知且 <= 阈值，
+       已停止接单——不标出来会让人以为"这号明明可用为什么没流量"（见 pool.reserve_credits）。 */
+    if (s.reserve_blocked) tag += '<span class="tag warn" title="余额已低于保留积分阈值，停止接单（仍可签到/猫猫旅行，充值后自动恢复）">保留积分</span>';
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));

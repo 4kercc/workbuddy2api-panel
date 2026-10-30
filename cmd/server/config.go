@@ -69,6 +69,10 @@ type Config struct {
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
 		BalanceRefreshEnabled bool `json:"balance_refresh_enabled"` // 缺省 true；false = 关闭
 		BalanceRefreshMinutes int  `json:"balance_refresh_minutes"` // 缺省 5；<=0 回落 5
+		// 补领清扫：周期 accept 待接受的、claim 已达标未领的（不跑行为链路）。
+		// 兜住「新号自动跑时还没达标」「autoActions 白名单外」两类漏领。
+		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
+		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
 	} `json:"schedule"`
 
 	Global struct {
@@ -190,6 +194,10 @@ type Config struct {
 		// 错误策略）。默认 "30m"（≤48 次/天/模型）；"0" 关停（完全回到现状行为）；
 		// 空值回落默认。
 		CostExploreInterval string `json:"cost_explore_interval"`
+		// ReserveCredits 保留积分阈值：余额**已知**且 <= 该值的账号停止接单（仍在池中、
+		// 照常签到/猫猫旅行，充值后自动恢复），避免余额被用到 0 触发上游提醒短信。
+		// 用指针区分「未配置」与「显式 0」：nil → 缺省 10；0 = 关闭；负值 → 归 0。
+		ReserveCredits *int64 `json:"reserve_credits"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -208,10 +216,15 @@ type Config struct {
 	SessionTTL             time.Duration `json:"-"`
 	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
+	TaskSweepInterval      time.Duration `json:"-"` // 0 = 不启动（task_sweep_enabled=false）
 	ExpiringSoonDur        time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
 }
+
+// defaultReserveCredits 保留积分缺省阈值（pool.reserve_credits 未配置时生效）。
+// 余额 <= 该值的账号停止接单：避免余额被用到 0 触发上游提醒短信。
+const defaultReserveCredits = int64(10)
 
 // Default 默认配置。
 func Default() *Config {
@@ -240,6 +253,8 @@ func Default() *Config {
 	c.Schedule.BlackcatEnabled = true
 	c.Schedule.BalanceRefreshEnabled = true
 	c.Schedule.BalanceRefreshMinutes = 5
+	c.Schedule.TaskSweepEnabled = true
+	c.Schedule.TaskSweepMinutes = 15
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -265,6 +280,10 @@ func Default() *Config {
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
+	// 保留积分默认 10：余额 <= 10 的账号停止接单（首启生成的 config.json 会带上这个键，
+	// 用户看得见、改得动；缺省值不写进文件的话没人知道有这功能）。
+	rc := defaultReserveCredits
+	c.Pool.ReserveCredits = &rc
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
@@ -472,6 +491,16 @@ func (c *Config) normalize() error {
 	if c.CostExploreIntervalDur < 0 {
 		c.CostExploreIntervalDur = 0
 	}
+	// 保留积分（reserve_credits）：nil = 未配置 → 缺省 10；显式 0 = 关闭；负值归 0。
+	// 用指针而非 int 就是为了让「未配置」与「显式关闭」分开——否则 0 值会让
+	// 老配置文件静默变成「关闭」，而它其实只是没写过这个键。
+	if c.Pool.ReserveCredits == nil {
+		v := defaultReserveCredits
+		c.Pool.ReserveCredits = &v
+	} else if *c.Pool.ReserveCredits < 0 {
+		v := int64(0)
+		c.Pool.ReserveCredits = &v
+	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
 	}
@@ -540,6 +569,13 @@ func (c *Config) normalize() error {
 			c.Schedule.BalanceRefreshMinutes = 5
 		}
 		c.BalanceRefreshInterval = time.Duration(c.Schedule.BalanceRefreshMinutes) * time.Minute
+	}
+	// 补领清扫：启用时 minutes<=0 回落默认 15；关闭时 interval 保持 0（不启动）。
+	if c.Schedule.TaskSweepEnabled {
+		if c.Schedule.TaskSweepMinutes <= 0 {
+			c.Schedule.TaskSweepMinutes = 15
+		}
+		c.TaskSweepInterval = time.Duration(c.Schedule.TaskSweepMinutes) * time.Minute
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err

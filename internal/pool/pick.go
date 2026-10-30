@@ -65,6 +65,9 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		if p.inFlightFull(e) {
 			continue // 在途占满：跳过（max=0 不限时不触发）
 		}
+		if p.reserveBlocked(e) {
+			continue // 保留积分停牌：余额已知且低于阈值 → 停止接单（防打到 0 触发上游短信）
+		}
 		cands = append(cands, e)
 	}
 	if len(cands) == 0 {
@@ -248,6 +251,9 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		}
 		if p.inFlightFull(e) {
 			continue
+		}
+		if p.reserveBlocked(e) {
+			continue // 保留积分停牌号连兜底也不接单：兜底同样会真实消耗余额
 		}
 		exp := e.expiry(now)
 		if exp.IsZero() {

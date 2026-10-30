@@ -32,8 +32,9 @@ import (
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
 // 本 fork 自 1.11.2-panel 起叠加能力（本地部署导入 / 提示词面板化 + 热生效 /
 // 两域模型汇聚 / 跨域模型路由 / 账号信息脱敏 / 任务队列自动扫描执行 / 今日新增积分 /
-// 401 死号识别 / 新任务自动发现 + 专家类动态适配 / 活动窗口动态化），故与上游 1.11.2 区分。
-const appVersion = "1.12.7-panel"
+// 401 死号识别 / 新任务自动发现 + 专家类动态适配 / 活动窗口动态化 /
+// 401 登录态求证 / 首帧否决 / 保留积分 / 补领清扫），故与上游 1.11.2 区分。
+const appVersion = "1.13.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -102,6 +103,9 @@ func main() {
 	p.SetDegrade(cfg.Pool.DegradeThreshold, cfg.DegradeCooldownDur, cfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(cfg.SoftRateMaxDur)                 // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
+	if cfg.Pool.ReserveCredits != nil {
+		p.SetReserveCredits(*cfg.Pool.ReserveCredits) // 保留积分：余额 <= 阈值停止接单（0 关停，缺省 10）
+	}
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 
 	// live 承载可热改字段（api_key / soft_rate / 脱敏开关 / 系统提示词 / 面板汇聚 /
@@ -207,6 +211,13 @@ func main() {
 				go pnRef.RunAutoQueueNow()
 			}
 		},
+		// 补领清扫：只 accept/claim，不跑行为链路（同步执行，秒级）。
+		SweepRunner: func() (int, string) {
+			if pnRef == nil {
+				return 0, "面板未装配"
+			}
+			return pnRef.RunTaskSweepNow()
+		},
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -242,6 +253,12 @@ func main() {
 		log.Printf("余额后台刷新已禁用（schedule.balance_refresh_enabled=false）")
 	case cfg.BalanceRefreshInterval > 0:
 		log.Printf("余额后台刷新：每 %s（签到时点照常额外刷新）", cfg.BalanceRefreshInterval)
+	}
+	switch {
+	case !cfg.Schedule.TaskSweepEnabled:
+		log.Printf("补领清扫已禁用（schedule.task_sweep_enabled=false）")
+	case cfg.TaskSweepInterval > 0:
+		log.Printf("补领清扫：每 %s（只 accept/claim，不跑行为链路）", cfg.TaskSweepInterval)
 	}
 	switch {
 	case !cfg.Schedule.TaskAutoEnabled:
@@ -321,6 +338,7 @@ func main() {
 	defer stop()
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
+	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -451,6 +469,9 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetDegrade(newCfg.Pool.DegradeThreshold, newCfg.DegradeCooldownDur, newCfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
 	p.SetCostExploreInterval(newCfg.CostExploreIntervalDur) // costTier 探索窗口热生效（0 关停）
+	if newCfg.Pool.ReserveCredits != nil {
+		p.SetReserveCredits(*newCfg.Pool.ReserveCredits) // 保留积分热生效（0 关停）
+	}
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
@@ -458,6 +479,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
 		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
+	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval) // 补领清扫间隔热生效（0 = 暂停循环）
 	// 任务队列自动执行：排程时点/开关热改 + 面板展示快照同步（状态接口据此显示
 	// 开关与下次执行时刻）。pn 为 nil 只可能出现在测试装配里。
 	sch.ReconfigureTaskAuto(newCfg.Schedule.TaskAutoHours, !newCfg.Schedule.TaskAutoEnabled)

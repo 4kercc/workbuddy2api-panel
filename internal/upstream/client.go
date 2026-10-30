@@ -29,7 +29,7 @@ const (
 	ErrNone           ErrKind = iota // 成功
 	ErrHardCredit                    // 余额不足（402 或 body 关键词）→ 长冷却
 	ErrSoftRate                      // 429 软限流 → 短冷却
-	ErrSessionDead                   // 401 鉴权失败（12153 offline session / APISIX 裸 401 HTML）→ 禁用或连续计数
+	ErrSessionDead                   // 登录态失效（带信封的 12153 / 无信封的网关 401 HTML）→ 先 refresh 求证再定罚不罚
 	ErrNotFound                      // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
 	ErrServer                        // 5xx 上游故障
 	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
@@ -368,6 +368,28 @@ func IsWafBlocked(status int, body string) bool {
 	return status == http.StatusForbidden && !hasBusinessEnvelope(body)
 }
 
+// IsGatewayUnauthorized 报告 401 响应是否为**网关层授权拒绝页**（无业务信封）。
+//
+// 形态（实测 CN 站 /v2/*，token 被上游判无效时）：
+//
+//	HTTP/1.1 401
+//	WWW-Authenticate: Bearer realm="copilot", error="invalid_token", ...
+//	Server: APISIX/3.9.1
+//	<body><html><head><title>401 Authorization Required</title>…openresty…</body>
+//
+// 与 403 WAF 页同族：都是边缘（APISIX）拦下来的 HTML 页，没有 `{"code":…}` 信封。
+// **业务层 401 一定带信封**（如 code 12153 offline session），走既有 sessionDeadMarkers。
+//
+// 判为 ErrSessionDead 的依据是实测：同一 token 在 /v3/config 仍 200、在 /v2/* 全 401，
+// 且 refresh 端点对该 token 回 invalid_grant——即「session 已被上游作废，只能重登」，
+// 不是请求头/UA/请求格式问题（同批健康的号用完全相同的一套头打 /v2/* 仍 200）。
+//
+// ⚠️ 但这个形态**不能一次即判死**：边缘抖动也会回同样的 HTML 页。计罚强度由调用方决定
+// ——余额探测与 chat 路径都先做 VerifySessionByRefresh 求证（见 verify.go）。
+func IsGatewayUnauthorized(status int, body string) bool {
+	return status == http.StatusUnauthorized && !hasBusinessEnvelope(body)
+}
+
 // retryAfterHeaderCandidates 冷却时长优先解析的响应头候选序列：
 // retry-after（秒，RFC 7231）/ retry-after-ms（毫秒）/ x-ratelimit-reset
 // （epoch 秒或毫秒，取 now+ 剩余量）。大小写不敏感（http.Header.Get 已归一）。
@@ -476,8 +498,8 @@ func ParseRateReset(body string) (time.Time, bool) {
 // 判定顺序自「严」到「宽」，每层的先后都有语义依据：
 //  0. 11102（IsModelBlocked）——「该后端无此模型」确定性答复，语义最具体，最先判
 //     （只认 400/404，429+11102 属限流语义走第 4 层）。
-//  1. 402 / 401 —— 402 是计费余额耗尽；401 是鉴权被拒（凭证失效，含 APISIX 裸 401
-//     HTML 与带业务信封的 12153）。两者都是账号级终态、最不可自愈，最先判。
+//  1. 402 —— 真正的计费余额耗尽状态码，最严、最不可自愈，最先判。
+//     （401 不在这层：见第 10.5 层，收窄为「网关层 401 无业务信封」。）
 //  2. sessionDeadMarkers —— 需要人工重登的终态。若 401 body 同时含 "12153" 与
 //     "rate limit"（如网关错误页混排），归 session_dead：短冷却救不活失效 session，
 //     误判为限流会让该死号留在池中反复被选中；且此层 marker 是精确词（12153 等），
@@ -506,6 +528,8 @@ func ParseRateReset(body string) (time.Time, bool) {
 //  10. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
 //     拦截形态。判在通用 4xx 兜底**之前**：此前该形态落 ErrClient → 只换号不罚 →
 //     连环 403。带业务信封的 403 已被上方各层捕获，走不到本层。
+//  10.5 IsGatewayUnauthorized —— 401 且无业务信封（APISIX HTML 授权拒绝页）：与
+//     403 WAF 页同族，判在同一层。带信封的 401（如 12153）已被第 2 层捕获。
 //  11. 内容策略/参数错误/其他 4xx —— 通用兜底。
 func Classify(status int, body string) ErrKind {
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
@@ -519,16 +543,10 @@ func Classify(status int, body string) ErrKind {
 	if status == http.StatusPaymentRequired {
 		return ErrHardCredit
 	}
-	// HTTP 401 = 鉴权被拒（凭证已失效），属于账号级终态，不是请求问题。
-	//
-	// 上游有两种形态：带业务信封的 12153（下方 sessionDeadMarkers 层已覆盖）与
-	// APISIX 网关直接回的裸 401 HTML（无信封、无任何 marker）。后者此前一路落到
-	// 4xx 兜底 ErrClient → 只换号不罚 → 死号永远留在池里：2026-10 实测 3 个 CN 号
-	// 连续 10 天余额查询 401，池仍报 15/15 可用、首页「服务正常」，运维完全看不到。
-	// 判在 marker 层之前：401 无论如何都是鉴权失败，与 marker 层对 12153 的结论一致。
-	if status == http.StatusUnauthorized {
-		return ErrSessionDead
-	}
+	// 注：401 的判定**不在这一层**。早期版本在此处 `status == 401 → ErrSessionDead`，
+	// 但那样会把带业务信封的非 12153 401 也一并判死，且无法与「边缘瞬时拦截」区分。
+	// 现收窄为「网关层 401（无业务信封）」，判在下方 IsWafBlocked 之后——与 403 WAF 页
+	// 同层同族（都是 APISIX 拦下来的 HTML 页），见 IsGatewayUnauthorized 的注释。
 	lower := strings.ToLower(body)
 	// sessionDead / accountFault 先于 status==429：账号级终态等不来自愈，限流状态码
 	// 不得掩盖它们（429+14017 必须 accountFault，401+12153 混排 "rate limit" 必须
@@ -602,6 +620,16 @@ func Classify(status int, body string) ErrKind {
 	// 带信封的 403 在上方各层已有权威分类，不受影响。
 	if IsWafBlocked(status, body) {
 		return ErrWafBlock
+	}
+	// 网关 401（APISIX/openresty HTML 页，无业务信封）：token 被上游判无效。
+	// 与 403 WAF 页同层同族——都是边缘拦下来的 HTML 页。判在通用 4xx 兜底之前：
+	// 落 ErrClient（旧行为）的代价是「只换号不罚」→ 死号永远留在池里，每个请求都
+	// 再打一遍、日志里刷一串 401（实测 3 个 CN 号连续 10 天余额 401，池仍报 15/15 可用）。
+	//
+	// 判死强度由调用方决定，本函数只给分类：余额探测与 chat 路径都会先做一次
+	// VerifySessionByRefresh 求证（边缘抖动同样回这个 HTML 页，不能一次即判死）。
+	if IsGatewayUnauthorized(status, body) {
+		return ErrSessionDead
 	}
 	// 图片格式/数据错误是确定性的请求级错误：同 body 换账号结果不变，直接
 	// fail-fast，避免把健康账号轮转一遍后仍把最终 503 返回给客户端。

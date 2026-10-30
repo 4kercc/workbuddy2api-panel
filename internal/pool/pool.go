@@ -37,6 +37,11 @@ type Pool struct {
 	exploreLast map[string]time.Time
 	// costExploreEvents 累计探索事件数（/status 透出；pick 写锁内 ++，无需 atomic）。
 	costExploreEvents int64
+	// reserveCredits 保留积分阈值（SetReserveCredits 注入；0 = 关闭，缺省 10）。
+	// 余额**已知**且 <= 该值的账号停止接单，避免余额被用到 0 触发上游提醒短信；
+	// 仍留在池中照常签到/猫猫旅行，充值后自动恢复。只拦已知余额（creditsTotal > 0）
+	// ——从未查过余额的账号不受影响，否则全新装机看起来整池不可用。
+	reserveCredits int64
 	// degradeThreshold / degradeCooldown / degradeCooldownMax 连败降权参数
 	// （SetDegrade 注入；默认值见 defaultDegrade*，issue #114）。
 	degradeThreshold   int
@@ -141,6 +146,18 @@ func (p *Pool) SetCostExploreInterval(d time.Duration) {
 		return // 负值非法，保留现值
 	}
 	p.costExploreInterval = d
+}
+
+// SetReserveCredits 注入「保留积分」阈值（main 从 config 注入；0 = 关闭，缺省 10）。
+// 与 SetCostExploreInterval 同风格：0 是合法值（关闭），负值非法保留现值。
+// 不落 state.json——config 是事实源，重启由 main 重新注入。
+func (p *Pool) SetReserveCredits(v int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if v < 0 {
+		return
+	}
+	p.reserveCredits = v
 }
 
 // CostExploreStatus 透出探索台账（/status 用）：累计探索事件数 + 各 (域, 模型)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -698,18 +699,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// token 临近过期 → 先 refresh（失败冷却换号）
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
 			if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
-				lastErr = err
 				var ue *upstream.Error
-				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-					h.cfg.Pool.Disable(acct.UID, "refresh session dead")
+				// refresh token 失效 ≠ 账号不可用：AT 尚未过期时本请求仍会成功。
+				// 这种号不罚、也不换号——直接拿现有 AT 发这一次请求。
+				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && upstream.SessionDeadButUsable(acct) {
+					log.Printf("INFO: [server] 账号 %s refresh token 已失效但 access token 仍有效，用现有 token 继续",
+						logfmt.Label(acct.UID, acct.Nickname))
 				} else {
-					h.cfg.Pool.NoteError(acct.UID)
+					lastErr = err
+					if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+						h.cfg.Pool.Disable(acct.UID, "refresh session dead")
+					} else {
+						h.cfg.Pool.NoteError(acct.UID)
+					}
+					fail(acct.UID)
+					if !rotateBackoff(i, r.Context()) {
+						break // ctx 取消：终止轮转（refresh 失败换号退避）
+					}
+					continue
 				}
-				fail(acct.UID)
-				if !rotateBackoff(i, r.Context()) {
-					break // ctx 取消：终止轮转（refresh 失败换号退避）
-				}
-				continue
 			}
 			if err := acct.SaveAtomic(); err != nil {
 				// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
@@ -847,6 +855,34 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
 			}))
+			// 首帧否决（见 upstream.HeadVetoError）：网关一个字节都没写出，这次尝试对
+			// 客户端完全无痕——按错误类型处置账号后换号，而不是把「HTTP 200 + error 帧」
+			// 透给客户端（SSE 发过字节就改不了状态码，此前只能这么兜底）。
+			var hv *upstream.HeadVetoError
+			if errors.As(sErr, &hv) {
+				recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+				st.status = http.StatusServiceUnavailable
+				// 上游 body 是活的（200 长流），随轮转立即关闭，不留给函数末尾的 defer 堆 fd。
+				rc.Close()
+				fail(acct.UID)
+				if hv.Payload == "" {
+					// 零有效帧：上游缺陷，不是账号的问题（不罚号），但换号值得一试。
+					lastErr = sErr
+					log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (no byte written, rotating)",
+						logfmt.Label(acct.UID, acct.Nickname), bareModel)
+				} else {
+					// 帧内错误没有独立 HTTP 状态：末端映射只看 Kind。
+					kind := upstream.FrameKind(hv.Payload)
+					h.applyErrorPolicy(acct.UID, kind, hv.Payload, bareModel, nil)
+					lastErr = &upstream.Error{Kind: kind, Msg: hv.Payload}
+					log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame before first byte kind=%s (rotating): %s",
+						logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(hv.Payload, 200))
+				}
+				if !rotateBackoff(i, r.Context()) {
+					break // ctx 取消：终止轮转（首帧否决换号退避）
+				}
+				continue
+			}
 			if upstream.IsEmptyStreamError(sErr) {
 				// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE]
 				// 兜底（HTTP 头已发出只能 200），但这是上游缺陷不是成功——日志/
@@ -988,8 +1024,9 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //     起 · softStreak 指数、封顶 soft_rate_max 的既有 CooldownSoftRate 有界退避。
 //     基数经 jitterDur 抖动（防多账号同相位冷却到期再聚团）。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩。
-//   - ErrSessionDead → 12153（上游明说 offline session）立即 Disable；裸 401（无
-//     12153 文案，如 APISIX 网关鉴权页）走连续计数，达阈值才 Disable（需人工重登）。
+//   - ErrSessionDead → 12153（上游明说 offline session）立即 Disable；网关 401（无业务
+//     信封的 APISIX HTML 页）先做一次 refresh 求证——Alive 只软冷却（瞬时拦截）、
+//     Inconclusive 只短退避、Dead 才走连续计数达阈值 Disable。
 //   - ErrContentBlocked → 不罚账号；passthrough 首遇触发降级重试，最终仍拦则回 400。
 //   - ErrBadParams → 不罚账号（同 ErrContentBlocked 待遇），但仍轮转。
 //   - ErrPromptTooLong → 11115：请求的问题不是账号的问题。零动作（不冷却/不熔断/
@@ -1046,15 +1083,43 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		}
 		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
 	case upstream.ErrSessionDead:
-		// 12153（"Offline user session not found"）是上游明确判定的 session 终态 →
-		// 立即禁用。裸 401（无 12153 文案，如 APISIX 网关回的 401 HTML）同样代表
-		// 凭证被拒，但可能只是瞬时抖动 → 走连续计数（与 keepalive / 余额刷新共用
-		// 计数器），达到阈值才禁用——一次失败就杀号是 P0-1 的历史教训（13 个被误
-		// 禁用的号 refresh 全部成功）。
-		if !strings.Contains(body, "12153") && !strings.Contains(body, "Offline user session not found") {
-			const reason = "401 auth failed (re-login required)"
-			if h.cfg.Pool.NoteSessionDeadReason(uid, reason) {
-				log.Printf("WARN: [server] 401 acct=%s: 连续 %d 次鉴权失败 — 禁用（需重新登录）",
+		// 两种形态同属「session 已死，只能重登」，但成因不同、处置强度也不同：
+		//   - 业务码 12153（refresh 端点/应用层明说 offline session 失效）→ 一次即禁。
+		//   - 网关 401 invalid_token（APISIX HTML 页，无业务信封）→ **先 refresh 求证**，
+		//     判死才走连续阈值。
+		// 理由：网关 401 的响应体完全一样，「token 真失效」与「边缘瞬时拦截」单看
+		// 401 分不出来。实测（两号各累计 3 次 401 被禁，revive 后立刻全 200）即后者。
+		if uerr != nil && upstream.IsGatewayUnauthorized(uerr.Status, body) {
+			if acct := h.cfg.Pool.AuthByUID(uid); acct != nil && h.cfg.Upstream != nil {
+				switch h.cfg.Upstream.VerifySessionByRefresh(acct) {
+				case upstream.VerifyAlive:
+					// 上游已轮换 RT：必须落盘，否则重启拿旧 RT 刷新 = 账号真死。
+					if serr := acct.SaveAtomic(); serr != nil {
+						log.Printf("ERR: [server] 网关 401 后 refresh 成功但落盘失败: %v", serr)
+					}
+					h.cfg.Pool.ClearSessionDead(uid)
+					// 用 CooldownSoftRate 而非固定 Cooldown：60s 起按 softStreak 翻倍
+					// （封顶 soft_rate_max），任何一次成功即清零。防「chat 恒 401 但
+					// refresh 恒成功」的降级 token 每 60s 轮换一次 RT（1440 次/天）。
+					h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "gateway 401 (refresh ok, transient)")
+					log.Printf("INFO: [server] 账号 %s 网关 401 但 refresh 成功 → 瞬时拦截，不计 session dead",
+						logfmt.Label(uid, ""))
+					return
+				case upstream.VerifyInconclusive:
+					// refresh 未给出明确判词（网络/5xx/429/refresh 端点自身被拦）：
+					// 既不能判活也不能判死，只短退避。判死会在同一层再误杀一次。
+					h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "gateway 401 (refresh inconclusive)")
+					log.Printf("INFO: [server] 账号 %s 网关 401，refresh 未给出明确判词 → 不计 session dead",
+						logfmt.Label(uid, ""))
+					return
+				}
+				// VerifyDead：落到下面的计死逻辑。
+			}
+			// reason 带上「次数 + 已 refresh 验证」两个事实：面板只显示这一行，运维要能
+			// 一眼判断是「刚发生」还是「反复出现」，以及「是否已排除网关抖动」。
+			if h.cfg.Pool.NoteSessionDeadReason(uid, fmt.Sprintf(
+				"网关 401 × %d 且 refresh 验证失败（token 已确认失效）", pool.SessionDeadThreshold())) {
+				log.Printf("WARN: [server] 账号 %s 连续 %d 次网关 401 且 refresh 失败（token 确实失效）→ 禁用，需重新登录",
 					logfmt.Label(uid, ""), pool.SessionDeadThreshold())
 			}
 			return

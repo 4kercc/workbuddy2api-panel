@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -63,6 +62,15 @@ type Config struct {
 	// 契约：回调内部**必须自行异步**（队列含真实对话任务，单轮可达数十分钟），
 	// 排程主循环不等待它——否则跨过后续时点会让签到/保活整点漏跑。
 	TaskAutoFn func()
+
+	// SweepRunner 补领清扫的落地回调（main 注入面板实现：只 accept 待接受的、
+	// 只 claim 已达标未领的，不跑行为链路）。nil = 未装配，静默跳过。
+	// 返回 (清扫账号数, 摘要) 仅用于日志。
+	//
+	// 契约：与 TaskAutoFn 相反，本回调**同步执行**——补领是纯状态流转（每账号
+	// 2 次列表请求 + 少量 accept/claim），秒级完成，不需要异步；周期也长（分钟级），
+	// 阻塞循环一轮无影响。
+	SweepRunner func() (int, string)
 }
 
 // Scheduler 调度器。
@@ -75,15 +83,28 @@ type Scheduler struct {
 	adoptTried map[string]string
 
 	// schedMu 保护排程参数（时点/开关）；Reconfigure 可在运行期热改（面板保存配置时调用）。
-	// rearmSchedule/rearmBalance 是「排程已变，立即重算」通知：Run 与余额刷新循环各自消费，
-	// 分别用独立 channel（同 channel 被两个 select 消费会丢信号）。
+	// rearmSchedule/rearmBalance/rearmSweep 是「排程已变，立即重算」通知：Run 与
+	// 余额刷新/补领清扫循环各自消费，分别用独立 channel（同 channel 被两个 select
+	// 消费会丢信号）。
 	schedMu       sync.Mutex
 	rearmSchedule chan struct{}
 	rearmBalance  chan struct{}
+	rearmSweep    chan struct{}
 
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
+
+	// sweepInterval 补领清扫间隔（纳秒，0=暂停）。与 balanceInterval 同口径：
+	// atomic 读写，SetTaskSweepInterval 可热改（面板保存配置）。
+	sweepInterval atomic.Int64
+
+	// authHealMu/authHealAt 余额 401 → refresh 求证的退避表（uid → 上次**求证成功**时刻）。
+	// 降级 token（billing 恒 401 但 chat 仍可用）每轮探测都会 401，若每轮都刷新，
+	// 一天会轮换 288 次 RT。只记「成功」：真死号每轮 refresh 都回 12153 且不轮换 RT，
+	// 必须每轮都试，连续计数才能按预期在阈值内判死。进程重启即清零（无需持久化）。
+	authHealMu sync.Mutex
+	authHealAt map[string]time.Time
 }
 
 // New 构建。
@@ -111,6 +132,7 @@ func New(cfg Config) *Scheduler {
 		adoptTried:    make(map[string]string),
 		rearmSchedule: make(chan struct{}, 1),
 		rearmBalance:  make(chan struct{}, 1),
+		rearmSweep:    make(chan struct{}, 1),
 	}
 }
 
@@ -498,8 +520,16 @@ func (s *Scheduler) RunKeepaliveNow() {
 			continue
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
+			// refresh token 失效 ≠ 账号不可用：AT 还没过期时 chat 仍正常。
+			// 这种号既不计 session dead（连续 3 次保活就会禁用掉健康号），也不打 WARN
+			// ——面板的错误汇总按 WARN 聚合，打 WARN 会让「保活失败」一直挂在页面上。
+			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && upstream.SessionDeadButUsable(a) {
+				log.Printf("INFO: keepalive %s: refresh token 已失效但 access token 仍有效，本轮跳过（对话仍可用）",
+					logfmt.Label(st.UID, st.Nickname))
+				continue
+			}
+			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 				if s.cfg.Pool.NoteSessionDead(st.UID) {
 					log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
@@ -536,21 +566,11 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
 				// 鉴权失败回写池状态：余额刷新是每 5 分钟一次的全量体检，必须让它成为
 				// 死号的检测入口——否则上游 401 只在这里刷日志，池里该号仍是「可用」，
-				// 面板/首页一直显示正常（2026-10 实测：3 个 CN 号连续 10 天 401，
-				// 池仍报 15/15 可用）。连续 sessionDeadThreshold 次才禁用，防瞬时抖动。
-				var ue *upstream.Error
-				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-					// 两种上游形态分开记 reason：12153 = refresh token 被判定失效；
-					// 裸 401（APISIX 网关页）= 凭据被拒。面板上的排查方向不同。
-					reason := "401 auth failed (re-login required)"
-					if strings.Contains(ue.Msg, "12153") {
-						reason = "12153 session dead"
-					}
-					if s.cfg.Pool.NoteSessionDeadReason(uid, reason) {
-						log.Printf("balance %s: 连续 %d 次鉴权失败 — 禁用（需重新登录）",
-							logfmt.Label(uid, a.Nickname), pool.SessionDeadThreshold())
-					}
-				}
+				// 面板/首页一直显示正常（实测 3 个 CN 号连续 10 天 401，池仍报 15/15 可用）。
+				//
+				// 但**不能直接计罚**：网关 401 的 HTML 页无法区分「token 真失效」与
+				// 「边缘瞬时拦截」，故先做一次 refresh 求证（见 balance_401.go）。
+				s.noteBalanceAuthFailure(a, uid, err)
 				return
 			}
 			// 余额查询成功即证明凭证有效：清连续鉴权失败计数（与 keepalive 同一计数器）。

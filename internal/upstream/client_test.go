@@ -81,12 +81,17 @@ func TestClassify(t *testing.T) {
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},
 		{401, `Offline user session not found`, ErrSessionDead},
 		{401, `{"code":12153,"msg":"Offline user session not found"}`, ErrSessionDead},
-		// 401 一律是鉴权失败（凭证失效）：带业务信封的 12153 与 APISIX 网关的裸 401
-		// HTML 同归 session_dead。此前「401 + 未知业务码」判 ErrClient → 只换号不罚，
-		// 死号永远留在池里、面板一直显示可用（2026-10 实测 3 个 CN 号连续 10 天 401，
-		// 池仍报 15/15 可用）。裸 401 无任何 marker，必须靠状态码兜住。
-		{401, `{"code":9999,"msg":"bad token"}`, ErrSessionDead},
+		// 401 分两类，判据是「有没有业务信封」：
+		//   - 带信封的 12153（应用层明说 offline session）→ session_dead（上方 marker 层）
+		//   - 无信封的 APISIX HTML 授权拒绝页 → session_dead（第 10.5 层 IsGatewayUnauthorized）
+		//   - **带信封但不是 12153** 的 401 → 不判死（落通用 4xx 兜底）：业务层 401 一定
+		//     带信封，非 12153 说明不是「登录态失效」这一种成因，判死会误杀。
+		// 早期版本「401 一律判死」，实测代价是边缘抖动同样回 HTML 页 → 连续 3 次即禁用
+		// 健康账号（生产实测：两号被禁后 revive 立刻全 200），故收窄。
+		{401, `{"code":9999,"msg":"bad token"}`, ErrClient},
 		{401, `<html><head><title>401 Authorization Required</title></head><body><center><h1>401 Authorization Required</h1></center></body></html>`, ErrSessionDead},
+		// 空体 401 同样是网关拒绝页形态（无信封）→ session_dead。
+		{401, ``, ErrSessionDead},
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
 		{200, ``, ErrNone},

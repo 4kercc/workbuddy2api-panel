@@ -380,6 +380,19 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 	return e.a
 }
 
+// reserveBlocked 报告账号是否因「保留积分」停牌（不再接单）。调用方须持锁。
+//
+// 阈值 0 = 关闭；只拦**已知**余额（creditsTotal > 0，与 Status.CreditsTotal 的
+// 「0 = 未知」同口径）——从未查过余额的账号不受影响，否则全新装机看起来整池不可用。
+//
+// 与参考实现（fork misakano7545）的差异：他们还有一条「请求模型是免费档时豁免」的
+// 分支（见底号把最后额度留给免费模型）。本 fork 的 pool 没有上游模型倍率表
+// （modelRateOf），判不出「免费档」，故不做该豁免——宁可对免费模型也保守拦下，
+// 也不引一张不完整的倍率表来做半截判断。
+func (p *Pool) reserveBlocked(e *entry) bool {
+	return p.reserveCredits > 0 && e.creditsTotal > 0 && e.credits <= p.reserveCredits
+}
+
 // CountsDetailed 返回 total/healthy/cooling/disabled/inFlightFull 五类计数。
 // cooling 含常规冷却（until）与熔断期（breakerUntil）。
 // 注意：healthy 口径不含 inFlight 维度（是状态机权威判定，只看 disabled/until/breakerUntil）；
@@ -484,6 +497,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
 		Reason:            e.reason,
 		Disabled:          e.disabled,
+		ReserveBlocked:    p.reserveBlocked(e),
 		SuccessCount:      e.successCount,
 		ErrTotal:          e.errTotal,
 		TokenUsage:        e.tokenUsage,

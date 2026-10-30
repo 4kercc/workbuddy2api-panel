@@ -698,3 +698,63 @@ WorkBuddy_Valorant    0/1 → 1/1  已召唤「无畏契约拼豆专家」(ex_xQ
 
 **教训**：上游文案里的「名字」是给人看的，不能当主键；能用 ID 就用 ID，用名字时必须
 要求唯一，宁可报错也不猜。
+
+## 2026-10-30 · `1.13.0-panel`：移植 fork misakano7545 的四项健壮性能力
+
+对比发现 [misakano7545/workbuddy2api-panel](https://github.com/misakano7545/workbuddy2api-panel)
+（同一基线的另一个 fork，493 提交 / 9.7 万行）在**账号健康判定**上比本 fork 严谨，且有
+生产实测支撑。本次移植其中四项（不做多协议网关那类产品方向差异）。
+
+### 一、401 登录态求证（修正我们自己的误杀风险）
+
+**问题**：本 fork 1.12.5 的 401 修法是「`Classify` 里 401 一律判 `ErrSessionDead`，
+余额刷新连续 3 次即禁用」。但网关 401 的响应体是 APISIX HTML 页，**「token 真失效」
+与「瞬时拦截」完全一样**，单看 401 分不出来 —— 连续 3 次瞬时拦截（风控/边缘抖动）
+会误杀健康账号。
+
+**他们的生产证据**：29 个账号里 4 个 refresh 恒回 12153，AT 却还有 26~333 天，
+`/v2/chat/completions` 全 200；把这种号计 session dead，会在连续 3 次保活后永久禁用
+一个完全健康的账号（「面板一片橙色、对话却秒回」）。另有实测：两号各累计 3 次 401 被禁，
+revive 后立刻全 200。
+
+**改动**：
+- `internal/upstream/verify.go`（新增）：`VerifyVerdict{Alive,Dead,Inconclusive}` +
+  `SessionDeadButUsable(a)`（AT 未过期即仍可用）+ `VerifySessionByRefresh(a)`（用 refresh
+  求判词；refresh 端点自身被拦/5xx/429 → **Inconclusive，不计罚**——否则在同一层再误杀一次）
+- `IsGatewayUnauthorized(status, body)`：401 **且无业务信封**才算网关拒绝页，与 403 WAF
+  同层判定。`Classify` 相应收窄：带信封的非 12153 401 不再判死（落通用 4xx）
+- `internal/scheduler/balance_401.go`（新增）：余额 401 → refresh 求证；
+  Alive → 换新 token + 清计数（退避 30 分钟，防降级 token 一天轮换 288 次 RT）；
+  Dead 且 `!SessionDeadButUsable` → 才计罚；其余 → 不计罚
+- 保活 / chat 预刷新路径：`SessionDeadButUsable` 时用现有 AT 继续，不计死不换号
+- chat 网关 401：先 `VerifySessionByRefresh`，Alive → 软冷却、Inconclusive → 短退避、
+  Dead → 连续阈值
+
+### 二、首帧否决（零输出守卫）
+
+**问题**：上游首帧就是 error 帧（6004 限流/审核/会话失效）或整条流零有效帧时，本 fork
+的 `StreamHint` 已写出响应头，只能以「HTTP 200 + error 帧」兜底 —— 客户端既不能重试也
+无法判断，网关侧下一次照旧挑同一个号撞同一面墙。
+
+**改动**：`HeadVetoError` + `StreamHint` 的 `headOpen` 窗口：向客户端写出第一个字节**之前**
+判出（带 error 键的帧 / 200 内嵌 `{code,msg}` 失败帧 / 零有效帧）就返回而不写字节；
+handler 据此**换号重发**（客户端无痕），`fail()` 同时解绑粘性会话。
+
+### 三、保留积分（`pool.reserve_credits`，缺省 10）
+
+余额**已知**（creditsTotal > 0）且 <= 阈值的账号停止接单，避免余额被用到 0 触发上游提醒
+短信；仍留在池中照常签到/猫猫旅行，充值后自动恢复。接入挑选主循环与全冷却兜底，
+面板账号行标「保留积分」。0 = 关闭。
+
+**与参考实现的差异**：他们还有「请求模型是免费档时豁免」的分支；本 fork 的 pool 没有上游
+模型倍率表，判不出免费档，故不做该豁免（宁可保守拦下，也不引一张不完整的表做半截判断）。
+
+### 四、补领清扫（`schedule.task_sweep_enabled`，缺省开 / 15 分钟）
+
+只 accept 待接受的、只 claim 已达标未领的，**不跑任何行为链路**（不真实对话、不上报事件），
+兜住「新号自动跑时还没达标」与「autoActions 白名单外」两类漏领 —— 后者正是 L1 里
+「达标未领不进待办队列」留下的缺口。领奖判据只用 `progress`（不用 accept_status：后者会
+短暂转 completed 后被整体回滚）；逐条失败只记 WARN 不中断（领奖幂等）。
+
+**验证**：四项均已部署到线上（`1.13.0-panel`），构建通过；401 求证与补领清扫的日志
+按实测贴在本节后续提交里。

@@ -84,6 +84,9 @@ type Status struct {
 	Realm           string     `json:"realm,omitempty"`
 	Disabled        bool       `json:"disabled"`
 	DisabledReason  string     `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	// ReserveBlocked 保留积分停牌：余额已知且 <= pool.reserve_credits，已停止接单
+	// （仍可签到/猫猫旅行，充值后自动恢复）。面板据此标「保留积分」。
+	ReserveBlocked  bool       `json:"reserve_blocked,omitempty"`
 	SuccessCount    int64      `json:"success_count,omitempty"`
 	ErrTotal        int64      `json:"err_total,omitempty"`
 	LastSuccessTime time.Time  `json:"last_success,omitempty"`
