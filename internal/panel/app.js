@@ -1082,6 +1082,10 @@ async function loadSchoolStatus(quiet) {
       list.innerHTML = ''; return;
     }
     let allDone = 0;
+    /* 活动期外（上游 in_period=false）：任务条目仍会返回且 status=pending，但做任务
+       不计分（scheduler 侧 schoolAccount 同样静默跳过）。此时必须显式标注，否则卡片
+       看起来像"永远做不完的待办"——2026-10-30 实测开学季已结束却仍显示 4 项 todo。 */
+    const inPeriodCount = arr.filter(v => v.in_period).length;
     const head = '<div class="shead"><div class="who">账号</div><div class="stasks">' +
       SCHOOL_META.map(([, name]) => '<span>' + esc(name) + '</span>').join('') +
       '</div><div class="luck">剩余抽奖</div></div>';
@@ -1098,13 +1102,16 @@ async function loadSchoolStatus(quiet) {
       const done = SCHOOL_META.filter(([code]) => code !== 'task_student_verify' && by[code] && by[code].status === 'claimed').length;
       allDone += done === 4 ? 1 : 0;
       return '<div class="srow">' +
-        '<div class="who"><div class="nm" title="' + esc(v.nickname || '') + '">' + esc(v.nickname || '未命名') + '</div><div class="id">' + esc(v.uid) + '</div></div>' +
+        '<div class="who"><div class="nm" title="' + esc(v.nickname || '') + '">' + esc(v.nickname || '未命名') + '</div><div class="id">' + esc(v.uid) + '</div>' +
+        (v.in_period === false ? '<div class="id">活动已结束</div>' : '') + '</div>' +
         '<div class="stasks">' + cells + '</div>' +
         '<div class="luck" title="剩余抽奖次数">' + LUCK_SVG + (v.chances == null ? '—' : v.chances) + '</div>' +
         (v.error ? '<div class="err">' + esc(v.error) + '</div>' : '') +
         '</div>';
     }).join('');
-    $('schoolSummary').textContent = allDone === arr.length ? '今日全部完成 🎉' : allDone + '/' + arr.length + ' 个账号今日全部完成';
+    $('schoolSummary').textContent = inPeriodCount === 0
+      ? '开学季活动已结束（上游 in_period=false），任务条目不计分'
+      : (allDone === arr.length ? '今日全部完成 🎉' : allDone + '/' + arr.length + ' 个账号今日全部完成');
     st.hidden = true;
   } catch (e) {
     st.hidden = false; st.className = 'state err'; st.textContent = e.message;

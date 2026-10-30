@@ -580,3 +580,22 @@ market/expert/list` 支持 `keyword` 参数，实测 6/6 专家可按名命中�
 `runExpertBatch` 召唤链，可做到新专家任务零代码改动。**该层会真实消耗对话额度，未开。**
 
 **唯一不可自动化**：`wb_wechat_oa_subscribe_task`（要求关注公众号满 24 小时）。
+
+### 2026-10-30 补充：开学季活动期口径对齐（同一根因）
+
+**问题**：开学季活动已结束（上游 `in_period=false`），但面板仍把 4 项/账号列为待办——
+实测 3 个 CN 账号共 12 项假待办，且「执行全部待办」会为每个账号排入一个 scheduler 侧
+**静默跳过的空闭环**（`scheduler/school.go` 的 `schoolAccount` 在 `!inPeriod` 时直接
+`return`），队列却报"完成"。
+
+**根因**：`internal/panel/taskcenter.go` 的 `tasksScanAll` 与 `planQueue` 都记录了
+`inPeriod` 但**没有用它过滤**——只有 scheduler 侧做了门控，面板侧漏了。
+
+**改动**：
+- `tasksScanAll`：`inPeriod` 为假时不收集开学季待办（保留 `in_period` 字段供前端展示）
+- `planQueue`：同上，不排开学季闭环
+- `internal/panel/app.js`：状态卡在 `in_period=false` 时账号行标「活动已结束」，
+  汇总行改为「开学季活动已结束（上游 in_period=false），任务条目不计分」
+
+**验证**：部署后扫描 `pending_count` 由 30 降为 18（12 项开学季假待办消失），
+`manual_count` 仍为 18（3 账号 × 6 个新任务）。

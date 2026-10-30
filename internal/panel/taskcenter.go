@@ -145,11 +145,17 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 				it.SchoolErr = err.Error()
 			} else {
 				it.InPeriod = inPeriod
-				for _, t := range stasks {
-					if schoolPending(t) {
-						it.School = append(it.School, schoolTaskView{
-							Code: t.TaskCode, Status: t.Status, Prog: t.Progress, Target: t.TargetCount,
-						})
+				// 活动期外不列待办：上游活动结束后接口**仍会返回 status=pending 的任务
+				// 条目**，但此时做任务不计分——scheduler 的 schoolAccount 同样按 in_period
+				// 静默跳过。不 gate 会在面板上留下永远做不完的假待办（2026-10-30 实测
+				// 开学季已结束、in_period=false，却仍列出 4 项/账号）。
+				if inPeriod {
+					for _, t := range stasks {
+						if schoolPending(t) {
+							it.School = append(it.School, schoolTaskView{
+								Code: t.TaskCode, Status: t.Status, Prog: t.Progress, Target: t.TargetCount,
+							})
+						}
 					}
 				}
 			}
@@ -336,7 +342,9 @@ func (p *Panel) planQueue(growth, school bool) queuePlan {
 				}
 			}
 			if wantSchool && p.cfg.Scheduler != nil {
-				if stasks, _, err := p.cfg.Upstream.SchoolTasks(a); err == nil {
+				// 与 tasksScanAll 同口径：活动期外（in_period=false）不排队——否则会
+				// 排入一个 scheduler 侧静默跳过的空闭环，队列却报"完成"。
+				if stasks, inPeriod, err := p.cfg.Upstream.SchoolTasks(a); err == nil && inPeriod {
 					for _, t := range stasks {
 						if schoolPending(t) { // 认证等不可做任务已在口径外
 							one.school = true
