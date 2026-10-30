@@ -101,6 +101,10 @@ type Status struct {
 	// 零值也透出（运维口径：与 err_total/session_dead_fails 一致，零值缺失会让人
 	// 误以为"没记录"，实际是零值被 omitempty 省略）。
 	ConsecutiveFails int       `json:"consecutive_fails"`
+	// SessionDeadFails 连续「登录态失效」计数（见 entry.sessionDeadFails）：
+	// 达 pool.SessionDeadThreshold() 即禁用。透出给运维看「距禁用还有几次」——
+	// 401 求证路径（余额探测/chat）每轮都会报当前进度。
+	SessionDeadFails int       `json:"session_dead_fails"`
 	DegradeUntil     time.Time `json:"degrade_until,omitempty"` // 连败降权截止（非零且未过 = 降权中）
 	// 运行态（不持久化）：在途请求数 + 熔断器状态。
 	InFlight     int       `json:"in_flight"`
