@@ -1045,6 +1045,122 @@ func runExpertTeamUse(p *Panel, a *auth.Auth) (string, error) {
 	return runExpertBatch(p, a, "team", 3)
 }
 
+// summonExpertOnce 对单个专家执行一次完整「召唤链 → 真实对话 → 使用事件」。
+// 批量（runExpertBatch）与动态适配（runExpertNamed）共用这一份实现，避免两条链路
+// 的事件形状漂移（事件形状是上游判据，漂移即不点亮）。
+func summonExpertOnce(p *Panel, a *auth.Auth, e upstream.MarketExpert) error {
+	// 召唤链（web_element_click + summon_click + summoned）。
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopExpertSummonSequence(e)...); err != nil {
+		return fmt.Errorf("召唤链: %w", err)
+	}
+	// 真实 chat（带 X-Expert-Id）→ 服务端 requestId。
+	conv, req, err := p.cfg.Upstream.DesktopChatWithExpert(a, e.ExpertID)
+	if err != nil {
+		return fmt.Errorf("真实对话: %w", err)
+	}
+	// 使用事件（JOIN 服务端 requestId）+ chat 链。
+	events := append(upstream.DesktopChatSequence(conv, req, "msg-"+req[len(req)-8:], "fast-model", "fast-model"),
+		upstream.DesktopExpertActualUseEvent(e, conv, req))
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+		return fmt.Errorf("使用事件: %w", err)
+	}
+	return nil
+}
+
+// matchExpertByName 在搜索结果里按名字精确匹配专家。
+// display_name_zh 与 profession_zh 都要看——实测「商家宣传页与海报设计师」的
+// display_name_zh 是「商家宣传设计师」，profession_zh 才是任务文案里那个名字。
+func matchExpertByName(experts []upstream.MarketExpert, name string) (upstream.MarketExpert, bool) {
+	for _, e := range experts {
+		if e.DisplayNameZH == name || e.ProfessionZH == name {
+			return e, true
+		}
+	}
+	return upstream.MarketExpert{}, false
+}
+
+// runExpertNamed 按名字在专家市场搜到该专家并完成一次召唤+使用链（L2 动态适配执行端）。
+//
+// 搜不到精确命中就**直接报错返回**，不猜、不换人：把一个错误的专家召唤了既浪费积分
+// 又可能点亮别的任务，报错让人工介入更诚实。
+func runExpertNamed(p *Panel, a *auth.Auth, name string) (string, error) {
+	experts, err := p.cfg.Upstream.MarketExpertSearch(a, "agent", name)
+	if err != nil {
+		return "", fmt.Errorf("搜索专家「%s」: %w", name, err)
+	}
+	e, ok := matchExpertByName(experts, name)
+	if !ok {
+		return "", fmt.Errorf("专家市场无精确匹配「%s」（搜索返回 %d 条，不猜不换人）", name, len(experts))
+	}
+	if err := summonExpertOnce(p, a, e); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("动态适配：已召唤「%s」(%s) 并完成一次真实对话", e.DisplayNameZH, e.ExpertID), nil
+}
+
+// betweenBrackets 取 s 中 verb 之后紧跟的「...」内容（verb 与「之间零字符）。
+// 返回空串表示没这个形态。按字节切片：Index 返回字节下标，「 是 3 字节。
+func betweenBrackets(s, verb string) string {
+	i := strings.Index(s, verb+"「")
+	if i < 0 {
+		return ""
+	}
+	rest := s[i+len(verb)+len("「"):]
+	j := strings.Index(rest, "」")
+	if j <= 0 {
+		return ""
+	}
+	return strings.TrimSpace(rest[:j])
+}
+
+// expertNameFromTask 从任务文案里提取「要召唤的专家名」；识别不出返回空串。
+//
+// 上游运营新上的专家任务文案高度同构（2026-10-30 实测 5/5 命中）：
+//
+//	task_desc: 在专家页搜索并召唤「抖音策略师」，完成一次对话。
+//	task_desc: 即日起至11月15日，在专家页搜索并召唤「无畏契约拼豆专家」，完成一次对话。
+//	title:     体验「腾讯轻量云」专家            ← desc 为空时的兜底
+//
+// 刻意**不认裸的「X」**：关注公众号任务的标题是「关注「腾讯 WorkBuddy」官方公众号」，
+// 裸模式会把公众号名当专家名去搜市场。title 兜底要求「」后紧跟「专家」（专家在括号
+// 外），避免把「体验「和平精英」主题」这类主题任务误判成专家任务。
+func expertNameFromTask(t upstream.Task) string {
+	for _, s := range []string{t.TaskDesc, t.Description} {
+		if n := betweenBrackets(s, "召唤"); n != "" {
+			return n
+		}
+	}
+	if i := strings.Index(t.Title, "体验「"); i >= 0 {
+		rest := t.Title[i+len("体验「"):]
+		if j := strings.Index(rest, "」专家"); j > 0 {
+			return strings.TrimSpace(rest[:j])
+		}
+	}
+	return ""
+}
+
+// resolveAction 解析任务的可执行动作：静态表优先，其次按文案做动态适配。
+//
+// 动态适配（L2）的意义：上游每上一个「体验某个专家」的任务，此前都要写一个 runXxx
+// 并登记进 autoActions——2026-10 一次上新 5 个专家任务，全部落在白名单外、面板上
+// 连显示都没有。改成按文案识别后，同类新任务零代码改动即可自动完成。
+func resolveAction(t upstream.Task) *autoAction {
+	if act := autoActionFor(t.TaskCode); act != nil {
+		return act
+	}
+	name := expertNameFromTask(t)
+	if name == "" {
+		return nil
+	}
+	return &autoAction{
+		TaskCode: t.TaskCode,
+		Desc:     "动态适配（专家类）：搜索并召唤「" + name + "」+ 真实对话",
+		run: func(p *Panel, a *auth.Auth) (string, error) {
+			return runExpertNamed(p, a, name)
+		},
+	}
+}
+
 // runExpertBatch 专家召唤+使用的公共实现。失败逐个继续，返回汇总信息。
 func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (string, error) {
 	experts, err := p.cfg.Upstream.MarketExpertList(a, expertType)
@@ -1059,22 +1175,7 @@ func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (strin
 		if ok >= count {
 			break
 		}
-		// 召唤链（web_element_click + summon_click + summoned）。
-		summonEvents := upstream.DesktopExpertSummonSequence(e)
-		if err := p.cfg.Upstream.ReportDesktopEvent(a, summonEvents...); err != nil {
-			fail++
-			continue
-		}
-		// 真实 chat（带 X-Expert-Id）→ 服务端 requestId。
-		conv, req, cerr := p.cfg.Upstream.DesktopChatWithExpert(a, e.ExpertID)
-		if cerr != nil {
-			fail++
-			continue
-		}
-		// 使用事件（JOIN 服务端 requestId）+ chat 链。
-		events := append(upstream.DesktopChatSequence(conv, req, "msg-"+req[len(req)-8:], "fast-model", "fast-model"),
-			upstream.DesktopExpertActualUseEvent(e, conv, req))
-		if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+		if err := summonExpertOnce(p, a, e); err != nil {
 			fail++
 			continue
 		}

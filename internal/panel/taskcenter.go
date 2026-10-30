@@ -47,7 +47,7 @@ type growthTaskView struct {
 
 // growthView 把上游任务包成展示条目（附"能否自动"标记）。
 func growthView(t upstream.Task) growthTaskView {
-	return growthTaskView{Task: t, Automatable: autoActionFor(t.TaskCode) != nil}
+	return growthTaskView{Task: t, Automatable: growthRunnable(t)}
 }
 
 // scanAccountItem 单账号扫描结果。
@@ -77,10 +77,11 @@ func growthPending(t upstream.Task) bool {
 	return true
 }
 
-// growthRunnable 任务是否可自动执行（**执行口径**）：待办 + 有登记动作。
-// 与改动前的 growthPending 逐字等价，队列行为不变——展示放宽不得顺带改变执行面。
+// growthRunnable 任务是否可自动执行（**执行口径**）：待办 + 能解析出动作。
+// 动作解析走 resolveAction：静态表优先，其次按文案动态适配（专家类任务）——
+// 所以上游新上的专家任务无需改代码即可执行。
 func growthRunnable(t upstream.Task) bool {
-	return growthPending(t) && autoActionFor(t.TaskCode) != nil
+	return growthPending(t) && resolveAction(t) != nil
 }
 
 // schoolPending 开学季任务是否待办（排除学生认证）。
@@ -605,10 +606,6 @@ func (p *Panel) acceptPendingTasks(a *auth.Auth) int {
 // runGrowthQueued 执行单个成长任务（动作 + 回读 + 自动领奖；与
 // accountTaskAuto 同语义，结果以文字返回）。
 func (p *Panel) runGrowthQueued(a *auth.Auth, code string) (string, error) {
-	act := autoActionFor(code)
-	if act == nil {
-		return "", fmt.Errorf("任务 %s 无自动动作", code)
-	}
 	// taskByCode 已双口径（mp 专属码自动回落 mp 列表）。
 	before, err := p.taskByCode(a, code)
 	if err != nil {
@@ -620,6 +617,12 @@ func (p *Panel) runGrowthQueued(a *auth.Auth, code string) (string, error) {
 	isMP := isMPTaskCode(code)
 	if before.Claimed {
 		return "已完成（已领取）", nil
+	}
+	// 动作在拿到任务之后再解析（而不是只按 code 查静态表）：动态适配要看任务的
+	// 文案（task_desc 里的专家名），只凭 code 解析不出来。
+	act := resolveAction(*before)
+	if act == nil {
+		return "", fmt.Errorf("任务 %s 无自动动作", code)
 	}
 	msg, err := act.run(p, a)
 	if err != nil {
@@ -741,6 +744,10 @@ func (p *Panel) schoolStatus(w http.ResponseWriter, r *http.Request) {
 		Err      string           `json:"error,omitempty"`
 	}
 	out := make([]acctView, 0, len(states))
+	// window 活动窗口（start_at/end_at/in_period）：活动级数据，各账号一致，取首个
+	// 成功值即可。面板标题据此显示，**不再硬编码活动日期**——此前面板写死
+	// 「09-13 ~ 09-24」，活动一换就得改代码（L3）。
+	var window *upstream.SchoolWindow
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	for _, st := range states {
@@ -774,7 +781,16 @@ func (p *Panel) schoolStatus(w http.ResponseWriter, r *http.Request) {
 					})
 				}
 			}
-			v.Chances, _ = p.cfg.Upstream.SchoolChances(a)
+			// /config 同时给出活动窗口与抽奖余额（此前只取了余额）。
+			if win, werr := p.cfg.Upstream.SchoolConfig(a); werr == nil {
+				v.Chances = win.Chances
+				mu.Lock()
+				if window == nil {
+					wc := win
+					window = &wc
+				}
+				mu.Unlock()
+			}
 			mu.Lock()
 			out = append(out, v)
 			mu.Unlock()
@@ -782,7 +798,7 @@ func (p *Panel) schoolStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	wg.Wait()
 	sort.Slice(out, func(i, j int) bool { return out[i].Nickname < out[j].Nickname })
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": out})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "window": window, "accounts": out})
 }
 
 // schoolRunAll 一键执行全部账号开学季闭环（异步，进度看任务频道日志）。

@@ -599,3 +599,58 @@ market/expert/list` 支持 `keyword` 参数，实测 6/6 专家可按名命中�
 
 **验证**：部署后扫描 `pending_count` 由 30 降为 18（12 项开学季假待办消失），
 `manual_count` 仍为 18（3 账号 × 6 个新任务）。
+
+## 2026-10-30 · `1.12.7-panel`：L2 专家类任务动态适配 + L3 活动窗口动态化
+
+### L2 · 专家类任务动态适配（零代码完成新专家任务）
+
+**背景**：L1 让新任务"看得见"，但 5 个 `expert_use_*` / `WorkBuddy_Valorant` 仍标
+「待适配」——上游每上一个「体验某个专家」的任务，此前都要写一个 `runXxx` 并登记进
+`autoActions`。实测这些任务的 `task_desc` 高度同构：
+
+```
+在专家页搜索并召唤「抖音策略师」，完成一次对话。
+即日起至11月15日，在专家页搜索并召唤「无畏契约拼豆专家」，完成一次对话。
+```
+
+**实现**：
+- `internal/panel/autotask.go`
+  - `expertNameFromTask()`：从 `task_desc`/`description` 取「召唤「X」」，`title` 为
+    「体验「X」专家」时兜底（要求「」后紧跟「专家」）。**刻意不认裸「X」**——关注公众号
+    任务标题是「关注「腾讯 WorkBuddy」官方公众号」，裸模式会把公众号当专家名
+  - `resolveAction(t)`：静态表优先，其次动态适配出带闭包的 `autoAction`
+  - `runExpertNamed()`：`keyword` 搜市场 → `matchExpertByName`（`display_name_zh` 与
+    `profession_zh` 都要看）→ 精确命中才执行；**搜不到直接报错返回，不猜不换人**
+  - `summonExpertOnce()`：从 `runExpertBatch` 抽出单专家链路，批量与动态适配共用
+    （避免两条链路事件形状漂移——事件形状是上游判据，漂移即不点亮）
+  - `growthRunnable` / `growthView` / `runGrowthQueued` 改用 `resolveAction`；
+    执行端改为「拿到任务后再解析动作」（动态适配要看 task 文案，只凭 code 解析不出）
+- `internal/upstream/desktop.go`：`MarketExpertSearch(a, expertType, keyword)` 与
+  `marketExpertList` 公共实现（`keyword` 实测服务端支持，搜「抖音策略师」第 2 条命中）
+- 新增 `internal/panel/dynamic_action_test.go`：9 个识别用例（全部取自真实文案）+
+  静态优先 + 动态适配 + 不可自动化 + 展示/执行口径分离
+
+**验证（2026-10-30 实测）**：6 个专家名 keyword 搜索 5 个精确命中；「商家宣传页与海报
+设计师」的 `display_name_zh` 是「商家宣传设计师」、`profession_zh` 才是任务文案里的名字
+——两个字段都匹配后 6/6 命中。
+
+**副作用（已知并接受）**：识别为专家类的任务会**进执行队列**，触发时对每个账号跑一次
+真实对话（消耗额度）。3 个 CN 账号 × 5 个专家任务 = 15 次对话/轮。要停就关
+`schedule.task_auto_enabled` 或不点「执行全部待办」。
+
+### L3 · 活动窗口动态化（不再硬编码活动日期）
+
+**实现**：
+- `internal/upstream/school.go`：新增 `SchoolWindow{InPeriod,StartAt,EndAt,Chances}` 与
+  `SchoolConfig()`；`SchoolChances()` 改为委托它（同一次 `/config` 调用）
+- `internal/panel/taskcenter.go`：`schoolStatus` 返回顶层 `window`（活动级数据，取首个
+  成功账号值），并把抽奖余额改由 `SchoolConfig` 一并取得（不增加上游调用次数）
+- `internal/panel/index.html`：`<h3>开学季 <span class="hint" id="schoolWindow">` 去掉写死的
+  「09-13 ~ 09-24」
+- `internal/panel/app.js`：`renderSchoolWindow()` 按 `start_at`/`end_at` 动态拼
+  「09-13 ~ 09-24 · 已结束」；`schoolDay()` 只取 MM-DD
+- `internal/scheduler/school.go` / `internal/upstream/school.go`：注释改为「窗口由上游控制」，
+  保留历史日期仅作判据逆向时点记录
+
+**实测上游窗口**：`start_at=2026-09-13 00:00:00`、`end_at=2026-09-24 23:59:59`、
+`in_period=False`。

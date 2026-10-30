@@ -1071,12 +1071,30 @@ function staskHTML(t) {
   return '<span class="stask todo"><span class="mark">○</span>未做</span>';
 }
 const LUCK_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.2 5.2 5 1.8l3 2.4 3-2.4 1.8 3.4-1.4 2.6 1.4 2.6-3.4 2.2H6l-3.4-2.2 1.4-2.6z" opacity=".9"/><circle cx="8" cy="9" r="1.1" fill="currentColor" stroke="none"/></svg>';
+/* 上游活动窗口是 "2006-01-02 15:04:05" 形态的本地时间串，只取 MM-DD 显示。 */
+function schoolDay(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s || '');
+  return m ? m[2] + '-' + m[3] : '';
+}
+/* 活动窗口标题：从上游 /config 的 start_at/end_at 动态拼，不再硬编码日期——
+   活动一换上游改配置即可，网关不用改代码（L3）。 */
+function renderSchoolWindow(w) {
+  const el = $('schoolWindow');
+  if (!el) return;
+  const a = schoolDay(w && w.start_at), b = schoolDay(w && w.end_at);
+  if (a && b) {
+    el.textContent = a + ' ~ ' + b + (w.in_period ? ' · 每日重置' : ' · 已结束');
+  } else {
+    el.textContent = w ? (w.in_period ? '进行中 · 每日重置' : '已结束') : '每日重置';
+  }
+}
 async function loadSchoolStatus(quiet) {
   const st = $('schoolState'), list = $('schoolList');
   if (!quiet) { st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">查询中</span>'; list.innerHTML = ''; }
   try {
     const d = await api('school/status');
     const arr = d.accounts || [];
+    renderSchoolWindow(d.window);
     if (!arr.length) {
       st.hidden = false; st.className = 'state'; st.textContent = '暂无可用账号';
       list.innerHTML = ''; return;

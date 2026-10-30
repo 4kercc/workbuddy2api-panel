@@ -379,9 +379,30 @@ type MarketExpert struct {
 // MarketExpertList 拉取专家市场真实专家列表（expertType: "agent" 单专家 / "team" 专家团）。
 // expert_actual_use 的判据校验要求 id 是平台上真实存在的专家（编造 id 不计数）。
 func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpert, error) {
-	body := map[string]any{"page": 1, "page_size": 20, "sort_by": "reco_rank", "sort_order": "desc"}
+	return c.marketExpertList(a, expertType, "", 20)
+}
+
+// MarketExpertSearch 按关键词搜索专家市场。
+//
+// 为什么需要：上游运营新上的「体验某个专家」类任务，task_desc 里只给出专家**名字**
+// （如「在专家页搜索并召唤「抖音策略师」，完成一次对话。」），而按推荐排序的列表只
+// 返回前 N 条、新专家通常不在其中（2026-10-30 实测：reco_rank 前 50 条里没有这 5 个
+// 新专家）。服务端支持 keyword 参数——搜「抖音策略师」第 2 条即精确命中。
+//
+// 命中判据要同时看 DisplayNameZH 与 ProfessionZH：实测「商家宣传页与海报设计师」
+// 的 display_name_zh 是「商家宣传设计师」，profession_zh 才是任务文案里那个名字。
+func (c *Client) MarketExpertSearch(a *auth.Auth, expertType, keyword string) ([]MarketExpert, error) {
+	return c.marketExpertList(a, expertType, keyword, 10)
+}
+
+// marketExpertList 专家市场列表/搜索的公共实现（keyword 为空即纯列表）。
+func (c *Client) marketExpertList(a *auth.Auth, expertType, keyword string, pageSize int) ([]MarketExpert, error) {
+	body := map[string]any{"page": 1, "page_size": pageSize, "sort_by": "reco_rank", "sort_order": "desc"}
 	if expertType != "" {
 		body["expert_type"] = expertType
+	}
+	if keyword != "" {
+		body["keyword"] = keyword
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {

@@ -1,4 +1,8 @@
-// school.go 开学季活动（school-season，活动期 2026-09-13 ~ 09-24）纯 API 自动化。
+// school.go 开学季活动（school-season）纯 API 自动化。
+//
+// 活动窗口不写死在代码里：/config 返回 in_period 与 start_at/end_at（开学季实测
+// 2026-09-13 00:00:00 ~ 2026-09-24 23:59:59），调用方以 in_period 为准决定做不做。
+// 下面提到的日期是判据逆向时的时间点，不是运行期依赖。
 //
 // 判据（2026-09-13 小程序 MCP 逆向 + 三账号实测，protocol.md §7.11）：
 //   - share_invite（每日 +100c +1抽奖）：POST /tasks/share-complete {channel:"wechat"}
@@ -93,15 +97,46 @@ func (c *Client) SchoolClaimTask(a *auth.Auth, taskCode string) (chanceGranted i
 
 // SchoolChances 当前抽奖次数余额。
 func (c *Client) SchoolChances(a *auth.Auth) (int, error) {
+	w, err := c.SchoolConfig(a)
+	if err != nil {
+		return 0, err
+	}
+	return w.Chances, nil
+}
+
+// SchoolWindow 活动窗口 + 抽奖余额（GET /config）。
+type SchoolWindow struct {
+	InPeriod bool   `json:"in_period"`
+	StartAt  string `json:"start_at,omitempty"` // 上游格式 "2006-01-02 15:04:05"
+	EndAt    string `json:"end_at,omitempty"`
+	Chances  int    `json:"chances"`
+}
+
+// SchoolConfig 读活动窗口与抽奖余额。
+//
+// 活动上下线由上游控制：/config 返回 start_at / end_at（实测开学季
+// "2026-09-13 00:00:00" ~ "2026-09-24 23:59:59"）与 in_period。网关据此显示
+// 活动窗口，**不再硬编码活动日期**——此前面板标题写死「09-13 ~ 09-24」，活动换了
+// 就得改代码。in_period=false 时上游仍返回任务条目（status=pending），调用方必须
+// 以 in_period 为准决定是否执行。
+func (c *Client) SchoolConfig(a *auth.Auth) (SchoolWindow, error) {
 	var out struct {
-		Chance struct {
+		InPeriod bool   `json:"in_period"`
+		StartAt  string `json:"start_at"`
+		EndAt    string `json:"end_at"`
+		Chance   struct {
 			Balance int `json:"balance"`
 		} `json:"chance"`
 	}
 	if err := c.schoolJSON(a, http.MethodGet, "/config", nil, &out); err != nil {
-		return 0, err
+		return SchoolWindow{}, err
 	}
-	return out.Chance.Balance, nil
+	return SchoolWindow{
+		InPeriod: out.InPeriod,
+		StartAt:  out.StartAt,
+		EndAt:    out.EndAt,
+		Chances:  out.Chance.Balance,
+	}, nil
 }
 
 // SchoolDraw 抽奖一次，返回奖品描述（prize_code + 积分）。
