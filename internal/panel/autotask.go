@@ -611,12 +611,6 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "task_code required")
 		return
 	}
-	act := autoActionFor(body.TaskCode)
-	if act == nil {
-		writeErr(w, http.StatusNotImplemented,
-			"该任务需要客户端内交互（无对应接口），无法自动完成；请按任务说明在官方客户端操作")
-		return
-	}
 	// per-account 互斥：同账号的任务动作正在跑（单任务或全量）时直接 409，
 	// 不并发重跑（动作幂等但 expert/skill 系含真实对话，重跑浪费配额）。
 	if !p.tryLockAccount(uid) {
@@ -626,13 +620,21 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	defer p.unlockAccount(uid)
 	// 前置读取：已完成的任务直接跳过（幂等，不浪费上游调用）。
 	// taskByCode 已双口径（mp 专属码自动回落 mp 列表）。
-	before, err := p.taskByCode(a, act.TaskCode)
+	before, err := p.taskByCode(a, body.TaskCode)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
 		return
 	}
 	if before == nil {
 		writeErr(w, http.StatusNotFound, "该账号没有此任务")
+		return
+	}
+	// 动作在拿到任务之后再解析（与队列执行同一口径）：动态适配要看 task 文案
+	// （task_desc 里的专家名），只凭 code 查静态表解析不出来。
+	act := resolveAction(*before)
+	if act == nil {
+		writeErr(w, http.StatusNotImplemented,
+			"该任务需要客户端内交互（无对应接口），无法自动完成；请按任务说明在官方客户端操作")
 		return
 	}
 	isMP := isMPTaskCode(act.TaskCode)
@@ -1248,7 +1250,28 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 		}
 	}
 
-	for _, act := range autoActions {
+	// 待执行动作 = 静态表 + 动态适配（专家类新任务）。
+	// 动态部分单独扫一遍账号当前待办：静态表未覆盖、但文案能解析出动作的补上，
+	// 使「一键完成全部可自动任务」与队列执行同一口径——上游新上的专家任务不用等改代码。
+	acts := make([]*autoAction, 0, len(autoActions))
+	for i := range autoActions {
+		acts = append(acts, &autoActions[i])
+	}
+	if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
+		seen := map[string]bool{}
+		for i := range autoActions {
+			seen[autoActions[i].TaskCode] = true
+		}
+		for _, t := range tasks {
+			if seen[t.TaskCode] || !growthRunnable(t) {
+				continue
+			}
+			if act := resolveAction(t); act != nil {
+				acts = append(acts, act)
+			}
+		}
+	}
+	for _, act := range acts {
 		item := map[string]any{"task_code": act.TaskCode, "desc": act.Desc}
 		before, err := p.taskByCode(a, act.TaskCode)
 		if err != nil {
