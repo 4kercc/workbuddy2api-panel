@@ -758,3 +758,29 @@ handler 据此**换号重发**（客户端无痕），`fail()` 同时解绑粘�
 
 **验证**：四项均已部署到线上（`1.13.0-panel`），构建通过；401 求证与补领清扫的日志
 按实测贴在本节后续提交里。
+
+### 验证记录（2026-10-30，`1.13.0-panel` 线上）
+
+**构建**：服务器 `docker compose up -d --build` 一次通过（首次因 `Status` 缺
+`SessionDeadFails` 字段失败，补字段后通过）。
+
+**测试**：用 `golang:1.23-alpine` 容器跑完整套件（本机无 Go 工具链，改在服务器跑）：
+`docker run --rm -v /root/workbuddy2api-panel:/src -w /src -e GOFLAGS=-mod=readonly golang:1.23-alpine go test ./...`
+
+首轮 **4 个用例失败**，全部是本次行为变更的预期结果（用例编码的是旧契约）：
+`TestRunKeepaliveSessionDeadResetBySuccess` / `TestRunBalanceRefreshMarksAuthFailure` /
+`TestRunBalanceRefreshClearsAuthFailureCount` / `TestStreamEmptyFramesCase`。
+按新语义更新用例后 **13 个包全绿**。
+
+**补领清扫实跑**（首轮 15 分钟后）：
+```
+2026/10/30 18:55:49 补领清扫：清扫 3 个账号（跳过 0）· 接受 0 · 领奖 0 · 出错 0
+```
+3 个 CN 账号全部扫过、零错误（当前无待接受/待领任务，符合预期）。
+
+**未取到实证的两项**（如实记录）：
+- **401 求证**：线上当前无 401（账号全健康），日志无「求证」记录。逻辑由单测覆盖
+  （含新增的 `TestRunBalanceRefreshAuthFailureUsableNotPunished`）。
+- **保留积分**：阈值 10，而现有账号余额最低 100（global 号）→ 没有账号落在触发区，
+  故 `reserve_blocked` 字段（omitempty）不出现。逻辑同上由代码路径 + 单测覆盖。
+  想现场验证可临时把 `pool.reserve_credits` 调到高于某号余额，或在面板看该号标记。
