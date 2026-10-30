@@ -1436,10 +1436,10 @@ $('btnScanAll').onclick = async () => {
   try {
     const d = await api('tasks/scan_all', { method: 'POST' });
     renderQueue(groupItems(d), null, '没有待办任务 🎉', '全部账号的成长任务与开学季活动都已完成，明日再来。');
-    /* 待适配 = 上游上了新任务、网关还没有对应动作。必须显式告知：这些任务会显示在
-       列表里但**不会**进执行队列，不说清楚会让人以为"扫描没用"。 */
+    /* 待适配 = 上游任务网关还没有对应动作。必须说清两件事，否则会让人以为"扫描没用"
+       或"这些任务会被自动跑掉"：①它们**不会进执行队列**；②只能手动完成。 */
     if (d.manual_count > 0) {
-      toast('上游有 ' + d.manual_count + ' 个新任务待适配（列表里标「待适配」，需手动完成）', 'warn');
+      toast('上游有 ' + d.manual_count + ' 项任务网关还没适配（列表里标「待适配」，不会进执行队列，需手动完成）', 'warn');
     }
   } catch (e) { toast(e.message, 'err'); }
   finally { b.disabled = false; b.textContent = '扫描待办'; }
@@ -1536,7 +1536,10 @@ function renderQueue(groups, progress, emptyTitle, emptyDesc) {
     return '<div class="qgroup"><header><span class="nm">' + esc(g.nick || g.uid.slice(0, 12)) + '</span><span class="cnt">' + g.rows.length + ' 项待办</span></header>' +
       g.rows.map(qrowHTML).join('') + '</div>';
   }).join('');
-  $('qcSummary').textContent = total + ' 项';
+  /* 待适配项常驻显示（不只靠一次性 toast）：这些任务**不会进执行队列**，
+     数量必须留在标题上，否则点完「执行全部待办」会以为它们被跑过了。 */
+  const manual = groups.reduce((n, g) => n + g.rows.filter(r => r.auto === false).length, 0);
+  $('qcSummary').textContent = total + ' 项' + (manual > 0 ? '（其中 ' + manual + ' 项待适配，不会自动执行）' : '');
   updateProgress(progress);
 }
 function updateProgress(q) {
