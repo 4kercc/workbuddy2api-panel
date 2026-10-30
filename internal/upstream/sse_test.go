@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -675,49 +676,106 @@ func TestAggregateEmptyStreamError(t *testing.T) {
 	}
 }
 
-// TestStreamEmptyFramesCase 覆盖流式空流检测：0 有效帧时写 error 帧（error 字段存活）,
-// 恰好一个 [DONE]，并返回非 nil error。
+// TestStreamEmptyFramesCase 空流的两条出口，取决于「有没有写过字节」：
+//   - 零字节（纯空流 / 只有 [DONE]）→ **HeadVetoError 且不写任何字节**：上层据此换号
+//     重发，客户端无痕（这是首帧否决的核心价值——旧行为只能以「200 + error 帧」兜底，
+//     客户端既不能重试也无法判断）。
+//   - 已写过注释/心跳行（响应头已提交）→ 只能照旧兜底：写 error 帧（error 字段存活）
+//     + 恰好一个 [DONE]，并返回 errEmptyStream 供调用方记 502 观测。
 func TestStreamEmptyFramesCase(t *testing.T) {
-	cases := []struct {
+	vetoCases := []struct {
 		name string
 		raw  string
 	}{
 		{"空流", ""},
-		{"只有注释行", ": comment\n\n"},
 		{"只有 DONE", "data: [DONE]\n\n"},
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
+	for _, c := range vetoCases {
+		t.Run("首帧否决/"+c.name, func(t *testing.T) {
 			rec := httptest.NewRecorder()
 			err := Stream(rec, strings.NewReader(c.raw))
-			if err == nil {
-				t.Fatalf("expected error, got nil")
+			var hv *HeadVetoError
+			if !errors.As(err, &hv) {
+				t.Fatalf("want HeadVetoError, got %v", err)
 			}
-			body := rec.Body.String()
-			if n := strings.Count(body, "data: [DONE]"); n != 1 {
-				t.Errorf("[DONE] count=%d want 1: %q", n, body)
+			if hv.Payload != "" {
+				t.Errorf("零有效帧的 Payload 应为空串，实际 %q", hv.Payload)
 			}
-			// error 帧必须原样保留 error 字段（未被 normalizeFrame 白名单剥掉）
-			var e map[string]any
-			found := false
-			for _, ln := range strings.Split(body, "\n") {
-				ln = strings.TrimSpace(ln)
-				if strings.HasPrefix(ln, "data: ") {
-					payload := strings.TrimPrefix(ln, "data: ")
-					if payload == "[DONE]" {
-						continue
-					}
-					if json.Unmarshal([]byte(payload), &e) == nil {
-						if em, ok := e["error"].(map[string]any); ok && em["message"] == "empty upstream stream" && em["type"] == "upstream_error" {
-							found = true
-						}
-					}
-				}
-			}
-			if !found {
-				t.Errorf("error frame absent or error field stripped: %q", body)
+			if body := rec.Body.String(); body != "" {
+				t.Errorf("首帧否决不得写出任何字节（写了上层就没法换号重发），实际 %q", body)
 			}
 		})
+	}
+
+	t.Run("已写过注释行只能兜底", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		err := Stream(rec, strings.NewReader(": comment\n\n"))
+		if !IsEmptyStreamError(err) {
+			t.Fatalf("want errEmptyStream（响应头已提交，只能兜底）, got %v", err)
+		}
+		body := rec.Body.String()
+		if n := strings.Count(body, "data: [DONE]"); n != 1 {
+			t.Errorf("[DONE] count=%d want 1: %q", n, body)
+		}
+		// error 帧必须原样保留 error 字段（未被 normalizeFrame 白名单剥掉）
+		if !strings.Contains(body, `"empty upstream stream"`) || !strings.Contains(body, `"upstream_error"`) {
+			t.Errorf("error frame absent or error field stripped: %q", body)
+		}
+	})
+}
+
+// TestStreamHeadVetoOnFirstErrorFrame 首帧即 error 帧 → 否决换号（不写字节）。
+// 旧行为会把它当「已开流的失败」以 200 + error 帧透出，客户端无法重试。
+func TestStreamHeadVetoOnFirstErrorFrame(t *testing.T) {
+	raw := `data: {"error":{"message":"model rate limited","code":6004}}` + "\n\n" +
+		`data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}` + "\n\n"
+	rec := httptest.NewRecorder()
+	err := Stream(rec, strings.NewReader(raw))
+	var hv *HeadVetoError
+	if !errors.As(err, &hv) {
+		t.Fatalf("want HeadVetoError, got %v", err)
+	}
+	if !strings.Contains(hv.Payload, "6004") {
+		t.Errorf("Payload 应带 error 帧原文，实际 %q", hv.Payload)
+	}
+	if body := rec.Body.String(); body != "" {
+		t.Errorf("否决不得写出任何字节，实际 %q", body)
+	}
+}
+
+// TestStreamHeadVetoOnEmbeddedFailureFrame 首帧是「200 内嵌失败帧」（带 code 无 choices）
+// 同样否决，且 Payload 被改写成标准 error 帧（下游 FrameKind 只认 error.message）。
+func TestStreamHeadVetoOnEmbeddedFailureFrame(t *testing.T) {
+	raw := `data: {"code":6021,"msg":"queue full","requestId":"req-1"}` + "\n\n"
+	rec := httptest.NewRecorder()
+	err := Stream(rec, strings.NewReader(raw))
+	var hv *HeadVetoError
+	if !errors.As(err, &hv) {
+		t.Fatalf("want HeadVetoError, got %v", err)
+	}
+	if !strings.Contains(hv.Payload, `"message":"queue full"`) || !strings.Contains(hv.Payload, `"requestId":"req-1"`) {
+		t.Errorf("Payload 应改写为标准 error 帧并保留 requestId，实际 %q", hv.Payload)
+	}
+	if body := rec.Body.String(); body != "" {
+		t.Errorf("否决不得写出任何字节，实际 %q", body)
+	}
+}
+
+// TestStreamNoVetoAfterFirstDataFrame 首帧是正常数据帧后，后续 error 帧**不再否决**
+// （响应头已提交，只能照旧透传）——保证否决窗口只覆盖「一个字节都没写出」的窗口。
+func TestStreamNoVetoAfterFirstDataFrame(t *testing.T) {
+	raw := `data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}` + "\n\n" +
+		`data: {"error":{"message":"boom","code":500}}` + "\n\n" +
+		"data: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	err := Stream(rec, strings.NewReader(raw))
+	var hv *HeadVetoError
+	if errors.As(err, &hv) {
+		t.Fatalf("已写出数据帧后不得否决，err=%v", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"hi"`) || !strings.Contains(body, `"boom"`) {
+		t.Errorf("首帧正文与后续 error 帧都应透传: %q", body)
 	}
 }
 

@@ -371,8 +371,12 @@ func TestRunKeepaliveSessionDeadDisables(t *testing.T) {
 	}
 }
 
-// TestRunKeepaliveSessionDeadResetBySuccess 两次 12153 后刷新成功 → 计数清零，
-// 再来的 12153 从第 1 次重新计（不会因历史失败被继续追杀）。
+// TestRunKeepaliveSessionDeadResetBySuccess 两次 12153 后刷新成功 → 计数清零。
+//
+// 注意：刷新成功会把 AT 续期，此后 12153 落在 SessionDeadButUsable（AT 仍有效）分支上
+// **不再计数**——这正是新语义的保护（refresh token 失效 ≠ 账号不可用，生产实测有
+// 29 个号里 4 个 refresh 恒 12153 但 chat 全 200）。所以要验证「清零后重新计数」，
+// 必须把 AT 重新置为已过期，模拟「AT 这次真的也过期了」。
 func TestRunKeepaliveSessionDeadResetBySuccess(t *testing.T) {
 	var fails atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -400,14 +404,30 @@ func TestRunKeepaliveSessionDeadResetBySuccess(t *testing.T) {
 	if st, _ := p.Status("u1"); st.Disabled {
 		t.Fatalf("precondition: 前 2 次不应禁用: %+v", st)
 	}
-	s.RunKeepaliveNow() // 刷新成功 → 清计数
-	// 接下来连续 2 次 12153：从新计数重新算，仍不应禁用（历史计数已清）。
-	s.RunKeepaliveNow() // 12153 #1（新计数）
-	s.RunKeepaliveNow() // 12153 #2（新计数）
-	if st, _ := p.Status("u1"); st.Disabled {
-		t.Fatalf("刷新成功清计数后连续 2 次 12153 不应禁用: %+v", st)
+	s.RunKeepaliveNow() // 刷新成功 → 清计数 + AT 续期
+	if st, _ := p.Status("u1"); st.SessionDeadFails != 0 {
+		t.Fatalf("刷新成功后计数应清零，实际 %d", st.SessionDeadFails)
 	}
-	s.RunKeepaliveNow() // 12153 #3（新计数）→ 禁用
+
+	// AT 已续期（未过期）→ 后续 12153 属「RT 死了但号还能用」：不计罚、不禁用。
+	s.RunKeepaliveNow()
+	s.RunKeepaliveNow()
+	s.RunKeepaliveNow()
+	if st, _ := p.Status("u1"); st.Disabled || st.SessionDeadFails != 0 {
+		t.Fatalf("AT 仍有效时 12153 不得计罚（SessionDeadButUsable）: disabled=%v count=%d",
+			st.Disabled, st.SessionDeadFails)
+	}
+
+	// 把 AT 置回已过期（模拟 AT 这次真的也到期了）→ 计数重新从 1 开始，第 3 次禁用。
+	a.Lock()
+	a.ExpiresAt = 1
+	a.Unlock()
+	s.RunKeepaliveNow() // 新计数 #1
+	s.RunKeepaliveNow() // 新计数 #2
+	if st, _ := p.Status("u1"); st.Disabled {
+		t.Fatalf("清零后连续 2 次不应禁用: %+v", st)
+	}
+	s.RunKeepaliveNow() // 新计数 #3 → 禁用
 	if st, _ := p.Status("u1"); !st.Disabled {
 		t.Fatalf("新计数第 3 次 12153 应禁用: %+v", st)
 	}
@@ -464,10 +484,12 @@ func TestRunBalanceRefreshNowUpdatesCreditsAndRevives(t *testing.T) {
 	}
 }
 
-// TestRunBalanceRefreshMarksAuthFailure 余额刷新是每 5 分钟一次的全量体检，必须
-// 成为死号的检测入口：裸 401（APISIX 网关页，无 12153 文案）此前只打日志、不回写
-// 池状态，导致 3 个 CN 号连续 10 天 401 而面板仍报 15/15 可用（2026-10 线上实测）。
-// 连续 sessionDeadThreshold 次才禁用（防瞬时抖动），reason 需与 12153 区分。
+// TestRunBalanceRefreshMarksAuthFailure 余额刷新是每 5 分钟一次的全量体检，必须成为
+// 死号的检测入口：裸 401（APISIX 网关页）此前只打日志、不回写池状态，导致 3 个 CN 号
+// 连续 10 天 401 而面板仍报 15/15 可用（线上实测）。
+//
+// 新语义：401 先做一次 refresh 求证，**AT 已过期**（号真的不能用）且 refresh 判死才计罚。
+// 本用例把 AT 设为已过期来走计数路径；「AT 仍有效则不计罚」见下一个用例。
 func TestRunBalanceRefreshMarksAuthFailure(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -476,7 +498,8 @@ func TestRunBalanceRefreshMarksAuthFailure(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	// ExpiresAt: 1 = AT 已过期：此时 refresh 判死等价于「号确实不能用」，应计罚。
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1})
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
 	s := New(Config{Pool: p, Upstream: up})
 
@@ -489,10 +512,39 @@ func TestRunBalanceRefreshMarksAuthFailure(t *testing.T) {
 	s.RunBalanceRefreshNow()
 	st, _ := p.Status("u1")
 	if !st.Disabled {
-		t.Fatalf("连续 %d 次 401 应禁用: %+v", pool.SessionDeadThreshold(), st)
+		t.Fatalf("连续 %d 次 401 且 refresh 判死应禁用: %+v", pool.SessionDeadThreshold(), st)
 	}
-	if st.DisabledReason != "401 auth failed (re-login required)" {
-		t.Errorf("disabled_reason=%q want 401 auth failed (re-login required)", st.DisabledReason)
+	if !strings.Contains(st.DisabledReason, "refresh 验证失败") {
+		t.Errorf("disabled_reason=%q 应说明已做 refresh 验证", st.DisabledReason)
+	}
+}
+
+// TestRunBalanceRefreshAuthFailureUsableNotPunished 401 且 refresh 判死，但 **AT 仍有效**
+// → 不计罚（SessionDeadButUsable）。生产实测：29 个号里 4 个 refresh 恒 12153，AT 却还有
+// 26~333 天、chat 全 200——计罚会在连续 3 轮后禁用掉完全健康的账号。
+func TestRunBalanceRefreshAuthFailureUsableNotPunished(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`<html><head><title>401 Authorization Required</title></head></html>`))
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	// ExpiresAt 远未来 = AT 仍有效 → 号还能干活，不得计罚。
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+
+	// 跑满两倍阈值也不得禁用。
+	for i := 0; i < pool.SessionDeadThreshold()*2; i++ {
+		s.RunBalanceRefreshNow()
+	}
+	st, _ := p.Status("u1")
+	if st.Disabled {
+		t.Fatalf("AT 仍有效时 401 不得禁用账号: %+v", st)
+	}
+	if st.SessionDeadFails != 0 {
+		t.Errorf("AT 仍有效时不得累计 session dead 计数，实际 %d", st.SessionDeadFails)
 	}
 }
 
@@ -512,7 +564,8 @@ func TestRunBalanceRefreshClearsAuthFailureCount(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	// AT 已过期：让 401 走「refresh 判死 → 计罚」路径（AT 有效时本就不计罚，测不到清零）。
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1})
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
 	s := New(Config{Pool: p, Upstream: up})
 
