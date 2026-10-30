@@ -35,26 +35,52 @@ type schoolTaskView struct {
 	Target int    `json:"target_count"`
 }
 
+// growthTaskView 成长任务条目（面板展示口径）= 上游 Task + 本 fork 的"能否自动"判定。
+//
+// 为什么单独包一层而不给 upstream.Task 加字段：动作表（autoActions）属于 panel 侧，
+// upstream 包不该知道它。展示与执行必须是两个口径——展示要列全（新活动看得见），
+// 执行只跑登记过动作的。
+type growthTaskView struct {
+	upstream.Task
+	Automatable bool `json:"automatable"` // 有登记动作（可自动执行）；false = 待适配
+}
+
+// growthView 把上游任务包成展示条目（附"能否自动"标记）。
+func growthView(t upstream.Task) growthTaskView {
+	return growthTaskView{Task: t, Automatable: autoActionFor(t.TaskCode) != nil}
+}
+
 // scanAccountItem 单账号扫描结果。
 type scanAccountItem struct {
 	UID       string           `json:"uid"`
 	Nickname  string           `json:"nickname"`
-	Growth    []upstream.Task  `json:"growth,omitempty"`
+	Growth    []growthTaskView `json:"growth,omitempty"`
 	GrowthErr string           `json:"growth_error,omitempty"`
 	School    []schoolTaskView `json:"school,omitempty"`
 	SchoolErr string           `json:"school_error,omitempty"`
 	InPeriod  bool             `json:"in_period"`
 }
 
-// growthPending 任务是否"未完成且可自动化"。
+// growthPending 任务是否"待办"（未领取且未达标）——**展示口径**。
+//
+// 刻意不再按动作白名单过滤：上游随时上线新活动，白名单会把新任务整条隐藏，运维在
+// 面板上完全看不到（2026-10 实测：`WorkBuddy_Valorant` + 4 个 `expert_use_*` +
+// 公众号关注共 6 个未完成任务、合计 400 积分，全部被静默隐藏）。新任务应当**显示
+// 出来并标记"待适配"**，让人知道上游上新了，而不是当作不存在。
 func growthPending(t upstream.Task) bool {
 	if t.Claimed {
 		return false
 	}
 	if t.Target > 0 && t.Current >= t.Target {
-		return false // 达标未领：也入队（队列执行后会自动领）
+		return false // 达标未领：走单账号「任务」弹窗的领奖入口，不进待办队列
 	}
-	return autoActionFor(t.TaskCode) != nil
+	return true
+}
+
+// growthRunnable 任务是否可自动执行（**执行口径**）：待办 + 有登记动作。
+// 与改动前的 growthPending 逐字等价，队列行为不变——展示放宽不得顺带改变执行面。
+func growthRunnable(t upstream.Task) bool {
+	return growthPending(t) && autoActionFor(t.TaskCode) != nil
 }
 
 // schoolPending 开学季任务是否待办（排除学生认证）。
@@ -97,7 +123,7 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			} else {
 				for _, t := range tasks {
 					if growthPending(t) {
-						it.Growth = append(it.Growth, t)
+						it.Growth = append(it.Growth, growthView(t))
 					}
 				}
 			}
@@ -111,7 +137,7 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 				}
 				for _, t := range mpTasks {
 					if growthPending(t) && !seen[t.TaskCode] {
-						it.Growth = append(it.Growth, t)
+						it.Growth = append(it.Growth, growthView(t))
 					}
 				}
 			}
@@ -130,12 +156,25 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 		}(i, st.UID)
 	}
 	wg.Wait()
-	pending := 0
+	pending, manual := 0, 0
 	for _, it := range items {
 		pending += len(it.Growth) + len(it.School)
+		for _, t := range it.Growth {
+			if !t.Automatable {
+				manual++
+			}
+		}
 	}
-	log.Printf("panel: 队列扫描完成：全部账号待办 %d 项（成长+开学季）", pending)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": items, "pending_count": pending})
+	// 待适配数单独报：这是「上游上了新任务、网关还没有对应动作」的信号，运维据此
+	// 知道该不该来加动作，而不是以为"没有待办"。
+	if manual > 0 {
+		log.Printf("panel: 队列扫描完成：全部账号待办 %d 项（成长+开学季），其中 %d 项待适配（上游新任务，无自动动作）", pending, manual)
+	} else {
+		log.Printf("panel: 队列扫描完成：全部账号待办 %d 项（成长+开学季）", pending)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "accounts": items, "pending_count": pending, "manual_count": manual,
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +312,7 @@ func (p *Panel) planQueue(growth, school bool) queuePlan {
 			if growth {
 				if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
 					for _, t := range tasks {
-						if growthPending(t) {
+						if growthRunnable(t) { // 执行口径：只排有登记动作的
 							one.grow = append(one.grow, t)
 						}
 					}
@@ -286,7 +325,7 @@ func (p *Panel) planQueue(growth, school bool) queuePlan {
 							seen[t.TaskCode] = true
 						}
 						for _, t := range mpTasks {
-							if growthPending(t) && !seen[t.TaskCode] {
+							if growthRunnable(t) && !seen[t.TaskCode] {
 								one.grow = append(one.grow, t)
 							}
 						}

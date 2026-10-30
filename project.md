@@ -532,3 +532,51 @@ conversationId 时才发该头（「透传优先」），global 请求因此稳�
 **回滚**：`git reset --hard 5574f59 && docker compose up -d --build`。
 
 
+
+## 2026-10-30 · `1.12.6-panel`：新任务自动发现（展示与执行口径拆分）
+
+**问题**：上游活动会自动上下线（开学季「校园日」已下线），但上游新上的任务在面板里
+**完全看不见**——`internal/panel/taskcenter.go` 的 `growthPending` 用动作白名单过滤
+（`return autoActionFor(t.TaskCode) != nil`），没登记动作的任务连展示都不进。
+
+**线上实测（2026-10-30，抓原始响应）**：上游任务接口返回 **24 个字段**，网关解析器只读
+16 个，丢掉的四个里有关键信息：
+
+| 字段 | 实测值示例 | 作用 |
+|---|---|---|
+| `valid_start` / `valid_end` | `2026-10-19T11:46:00+08:00` ~ `2026-11-15T23:59:00+08:00` | **活动起止**——上游据此自动上下线，这就是「活动会自动更新」的机制 |
+| `is_new` | `true` / `false` | 运营侧新任务角标 |
+| `template_id_fixed` | `23`、`11` | 模板类任务的目标模板 ID |
+
+当时 6 个未完成任务（合计 **400 积分 + 30 能量**）全被隐藏：
+`WorkBuddy_Valorant`(100c) / `expert_use_bowangwang` / `expert_use_douyinyin` /
+`expert_use_maidehao` / `expert_use_shangjia_xuanchuan`（各 50c）/
+`wb_wechat_oa_subscribe_task`(100c)。`school_season` 已从默认与 mp 两个口径双双消失。
+
+**改动（仅展示层，不碰执行路径）**：
+- `internal/upstream/tasks.go`：`Task` 增 `ValidStart` / `ValidEnd` / `IsNew` / `TemplateID`
+  四字段并在 `parseGrowthTasks` 解析
+- `internal/panel/taskcenter.go`：
+  - `growthPending` 去掉动作白名单 → **展示口径**（未领取且未达标全列）
+  - 新增 `growthRunnable` = `growthPending && autoActionFor != nil` → **执行口径**，
+    与改动前逐字等价（`planQueue` 两处改用它），队列行为不变
+  - 新增 `growthTaskView{upstream.Task; Automatable}` + `growthView()`；`scanAccountItem.Growth`
+    类型随之改为 `[]growthTaskView`（`automatable` 字段随 JSON 透出）
+  - 扫描返回增 `manual_count`，日志区分「其中 N 项待适配」
+- `internal/panel/app.js`：待办条目加「待适配」(warn) /「新」(ok) 标记 + 活动截止倒计时
+  （`validEndInfo`：<48h 红、<7 天黄）；扫描后 `manual_count>0` 弹 warn toast
+- `internal/panel/index.html`：补 `.tst.warn` 样式
+- 版本号 `1.12.6-panel`
+
+**为什么不自动执行新任务**：上游任务接口**不返回机器可读的动作描述**（无 event_code /
+action_type），只有 `task_code` + 人读文案。要自动完成必须知道「报什么事件」。本次只做
+发现层，执行仍需人工适配动作。
+
+**后续可做（已验证可行，未实施）**：5 个新专家任务的 `task_desc` 是同一模板
+「在专家页搜索并召唤「X」，完成一次对话。」；专家市场 `POST /portal/operation-platform/
+market/expert/list` 支持 `keyword` 参数，实测 6/6 专家可按名命中（需同时匹配
+`display_name_zh` 与 `profession_zh`，例「商家宣传页与海报设计师」的 display name 是
+「商家宣传设计师」）。即：从 `task_desc` 抽「X」→ keyword 搜市场 → 复用现有
+`runExpertBatch` 召唤链，可做到新专家任务零代码改动。**该层会真实消耗对话额度，未开。**
+
+**唯一不可自动化**：`wb_wechat_oa_subscribe_task`（要求关注公众号满 24 小时）。

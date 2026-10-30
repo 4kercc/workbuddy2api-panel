@@ -54,6 +54,16 @@ type Task struct {
 	Status       string `json:"status,omitempty"`    // 上游任务状态（complete 等）
 	Claimable    bool   `json:"claimable,omitempty"` // 进度达标且未领取（本地推算）
 	Claimed      bool   `json:"claimed,omitempty"`   // 已领取（accept_status == claimed）
+	// 活动生命周期与运营标记（2026-10 补：上游本来就返回这四项，此前解析器丢掉了）。
+	//
+	// valid_start/valid_end 是上游**自动上下线活动**的依据——活动一结束，任务立即从
+	// 列表消失（实测 school_season「校园日」活动结束后从默认与 mp 两个口径双双不见），
+	// 新活动上线也立刻出现。透出给面板做截止倒计时，替代硬编码活动日期。
+	// is_new 是运营侧给新任务打的角度标；template_id_fixed 是模板类任务的目标模板 ID。
+	ValidStart string `json:"valid_start,omitempty"`
+	ValidEnd   string `json:"valid_end,omitempty"`
+	IsNew      bool   `json:"is_new,omitempty"`
+	TemplateID int64  `json:"template_id_fixed,omitempty"`
 }
 
 // ListTasks 拉取全量任务列表（默认口径，无端标记头）。
@@ -164,6 +174,10 @@ func parseGrowthTasks(data json.RawMessage) ([]Task, error) {
 			Target       int64           `json:"target"`
 			Current      int64           `json:"current"`
 			Progress     json.RawMessage `json:"progress"`
+			ValidStart   string          `json:"valid_start"`
+			ValidEnd     string          `json:"valid_end"`
+			IsNew        bool            `json:"is_new"`
+			TemplateID   int64           `json:"template_id_fixed"`
 		} `json:"tasks"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
@@ -202,6 +216,10 @@ func parseGrowthTasks(data json.RawMessage) ([]Task, error) {
 			Status:       t.Status,
 			Claimable:    !claimed && tgt > 0 && cur >= tgt,
 			Claimed:      claimed,
+			ValidStart:   t.ValidStart,
+			ValidEnd:     t.ValidEnd,
+			IsNew:        t.IsNew,
+			TemplateID:   t.TemplateID,
 		})
 	}
 	return out, nil

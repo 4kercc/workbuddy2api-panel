@@ -1411,6 +1411,11 @@ $('btnScanAll').onclick = async () => {
   try {
     const d = await api('tasks/scan_all', { method: 'POST' });
     renderQueue(groupItems(d), null, '没有待办任务 🎉', '全部账号的成长任务与开学季活动都已完成，明日再来。');
+    /* 待适配 = 上游上了新任务、网关还没有对应动作。必须显式告知：这些任务会显示在
+       列表里但**不会**进执行队列，不说清楚会让人以为"扫描没用"。 */
+    if (d.manual_count > 0) {
+      toast('上游有 ' + d.manual_count + ' 个新任务待适配（列表里标「待适配」，需手动完成）', 'warn');
+    }
   } catch (e) { toast(e.message, 'err'); }
   finally { b.disabled = false; b.textContent = '扫描待办'; }
 };
@@ -1435,7 +1440,15 @@ function groupItems(d) {
     const rows = [];
     for (const t of (a.growth || [])) {
       GROWTH_TITLES[t.task_code] = t.title || t.task_code;
-      rows.push({ kind: 'growth', code: t.task_code, prog: t.target ? t.current + '/' + t.target : '—', status: 'scan' });
+      rows.push({
+        kind: 'growth', code: t.task_code,
+        prog: t.target ? t.current + '/' + t.target : '—', status: 'scan',
+        /* automatable=false = 上游新任务、网关还没有对应动作。旧后端无此字段时按
+           可自动处理（不误标「待适配」）。 */
+        auto: t.automatable !== false,
+        isNew: !!t.is_new,
+        validEnd: t.valid_end || '',
+      });
     }
     for (const t of (a.school || [])) {
       if (t.task_code === 'task_student_verify') continue; // 需真实认证，永不出现在待办
@@ -1446,14 +1459,35 @@ function groupItems(d) {
   return groups;
 }
 const ST_WORDS = { done: '完成', running: '执行中', error: '失败', skipped: '跳过', pending: '排队', scan: '待执行' };
+/* 活动截止倒计时：上游 valid_end 是带时区的 RFC3339。上游按该字段自动上下线活动
+   （活动结束任务即从列表消失），故只在剩余不多时提示，避免满屏噪音。 */
+function validEndInfo(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return null;
+  const ms = d.getTime() - Date.now();
+  if (ms <= 0) return { text: '已截止', cls: 'bad' };
+  const h = Math.floor(ms / 3600000), days = Math.floor(h / 24);
+  if (h < 48) return { text: '剩 ' + h + ' 小时', cls: 'bad' };
+  if (days < 7) return { text: '剩 ' + days + ' 天', cls: 'warn' };
+  return { text: '剩 ' + days + ' 天', cls: 'mute' };
+}
 function qrowHTML(it) {
   const isSchool = it.kind === 'school';
   const title = isSchool ? '开学季闭环' : (GROWTH_TITLES[it.code] || it.code);
   const dotCls = it.status === 'scan' ? 'wait' : it.status === 'running' ? 'run' : it.status === 'error' ? 'err' : it.status === 'skipped' ? 'skip' : it.status === 'done' ? 'done' : 'wait';
   const stWord = it.status === 'scan' ? '待执行' : (ST_WORDS[it.status] || it.status);
+  const tags = [];
+  if (isSchool) tags.push('<span class="tag mute">开学季</span>');
+  if (it.isNew) tags.push('<span class="tag ok" title="上游运营标记的新上线任务">新</span>');
+  if (it.kind === 'growth' && it.auto === false) {
+    tags.push('<span class="tag warn" title="上游新任务，网关还没有对应动作——本项只能手动完成；适配后即可自动执行">待适配</span>');
+  }
+  const ve = validEndInfo(it.validEnd);
+  if (ve) tags.push('<span class="tag ' + ve.cls + '" title="活动截止 ' + esc(it.validEnd) + '">' + esc(ve.text) + '</span>');
   return '<div class="qrow" title="' + esc(it.message || '') + '">' +
     '<span class="code">' + esc(it.code) + '</span>' +
-    '<span class="name"><span class="t">' + esc(title) + '</span>' + (isSchool ? '<span class="tag mute">开学季</span>' : '') + '</span>' +
+    '<span class="name"><span class="t">' + esc(title) + '</span>' + tags.join('') + '</span>' +
     '<span class="prog">' + esc(it.prog || '') + '</span>' +
     '<span class="st"><span class="qdot ' + dotCls + '"></span>' + stWord + '</span>' +
     '<span class="msg">' + esc(it.message || '') + '</span>' +
