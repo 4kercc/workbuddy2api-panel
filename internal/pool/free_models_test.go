@@ -36,10 +36,10 @@ func TestSetFreeModelsMatching(t *testing.T) {
 		want         bool
 	}{
 		{"global", "hy3", true},
-		{"global", "HY3", true},   // 大小写归一
-		{"cn", "hy3", false},      // 域不匹配
+		{"global", "HY3", true}, // 大小写归一
+		{"cn", "hy3", false},    // 域不匹配
 		{"global", "hy4free", true},
-		{"cn", "hy4free", true},   // 不限定域
+		{"cn", "hy4free", true}, // 不限定域
 		{"cn", "glm-x", true},
 		{"global", "glm-x", false}, // 域不匹配
 		{"global", "", false},      // 空模型不豁免

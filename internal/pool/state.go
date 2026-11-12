@@ -505,7 +505,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		ReserveBlocked:    p.reserveBlocked(e, ""),
 		// 免费模型白名单（本域适用）：面板据此把「保留积分」提示写成
 		//「付费模型停牌，免费模型仍可用」，而不是笼统说账号停用。
-		ReserveExemptModels: p.freeModelsForRealmLocked(e.a.Realm()),
+		ReserveFreeModels: p.freeModelsForRealmLocked(e.a.Realm()),
 		SuccessCount:      e.successCount,
 		ErrTotal:          e.errTotal,
 		TokenUsage:        e.tokenUsage,

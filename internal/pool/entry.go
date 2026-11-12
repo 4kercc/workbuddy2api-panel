@@ -87,10 +87,10 @@ type Status struct {
 	// ReserveBlocked 保留积分停牌：余额已知且 <= pool.reserve_credits，已停止接单
 	// （仍可签到/猫猫旅行，充值后自动恢复）。面板据此标「保留积分」。
 	ReserveBlocked  bool       `json:"reserve_blocked,omitempty"`
-	// ReserveExemptModels 该账号所在域的免费模型白名单（pool.free_models 中适用的条目）。
+	// ReserveFreeModels 该账号所在域的免费模型白名单（pool.free_models 中适用的条目）。
 	// 非空时「保留积分」只是**对付费模型**停牌：这些模型仍可调用（上游不扣额度）。
 	// 面板用它把提示写清楚，避免「明明标了停牌却还能跑」的困惑。
-	ReserveExemptModels []string `json:"reserve_exempt_models,omitempty"`
+	ReserveFreeModels []string `json:"reserve_exempt_models,omitempty"`
 	SuccessCount    int64      `json:"success_count,omitempty"`
 	ErrTotal        int64      `json:"err_total,omitempty"`
 	LastSuccessTime time.Time  `json:"last_success,omitempty"`
