@@ -784,3 +784,82 @@ handler 据此**换号重发**（客户端无痕），`fail()` 同时解绑粘�
 - **保留积分**：阈值 10，而现有账号余额最低 100（global 号）→ 没有账号落在触发区，
   故 `reserve_blocked` 字段（omitempty）不出现。逻辑同上由代码路径 + 单测覆盖。
   想现场验证可临时把 `pool.reserve_credits` 调到高于某号余额，或在面板看该号标记。
+
+## 2026-11-12 · `dev@86ea746`：免费模型白名单（`pool.free_models`，缺省 `["global:hy3"]`）
+
+### 背景：0 余额的国际号被本地两道闸永久挡死
+
+2026-11-12 全部 11 个 global 号（Free Plan，100 积分/月）额度耗尽，上游对任何模型
+（含目录标 `x0.00` 的 `deepseek-v4.1-flash`）返回 `429 / code=14018 Credits exhausted`；
+本地随后叠加两层拦截：
+
+1. 上游 14018 → `CoolHard`（`reason=余额不足`，冷却到次日 04:00）；
+2. 余额 `0 <= pool.reserve_credits(10)` → `reserve_blocked` 保留积分停牌。
+
+两层都**只针对付费模型**才是对的。实测（直连上游、绕过网关，账号余额 0/100）：
+
+```
+POST https://www.workbuddy.ai/console/chat/completions  {"model":"hy3"}
+→ HTTP 200，37 帧，usage.credit = 0，quota.percent = 0
+POST .../console/chat/completions                       {"model":"deepseek-v4.1-flash"}
+→ HTTP 429 {"code":14018,"msg":"Credits exhausted..."}
+```
+
+即上游对真 0 倍率模型（`hy3`，目录 `x0.00` + `badge:Free now`）**既不扣额度，也不要求
+余额 > 0**；`hy4free` 在国际版不存在（`11102 model service info not found`）。而
+`deepseek-v4.1-flash` 的 `x0.00` 只是目录展示值，实际照常扣费（11 月 4,623 次请求
+累计 1.97B prompt token 把 100 积分打穿；CN 对照组 819 token 扣 0.19 credit）。
+
+### 改动
+
+| 文件 | 变更 |
+|---|---|
+| `cmd/server/config.go` | 新增 `pool.free_models`（`[]string`，缺省 `["global:hy3"]`；空数组 = 关闭豁免） |
+| `internal/pool/pool.go` | `SetFreeModels` / `isFreeModel`（`realm:model` 精确匹配、`model` 不限域、大小写归一）/ `freeModelsForRealmLocked` |
+| `internal/pool/entry.go` | `healthy` 拆出 `healthyEx(now, exemptCreditCooldown)`；`healthyForModelEx` 只豁免 `CoolHard`（`CoolSoft`/熔断/降权/禁用照旧） |
+| `internal/pool/state.go` | `reserveBlocked(e, reqModel)` 命中白名单即放行；`Status` 新增 `reserve_exempt_models` |
+| `internal/pool/pick.go` | 主选号 + 全冷却兜底同口径豁免；新增 `PickForProbe(realm)` |
+| `internal/pool/realm.go` | `AvailableUIDsForModelRealm` 走 `healthyForModelEx`（粘性分配同口径） |
+| `internal/server/handler.go` | `fetchGlobalModels` 改用 `PickForProbe("global")` |
+| `internal/panel/panel.go` | 模型页 global 分支改用 `PickForProbe` |
+| `internal/panel/app.js` | 「保留积分」tooltip 追加「免费模型不受此限，仍可调用：hy3」 |
+
+**为什么必须有 `PickForProbe`**：模型目录探测（`/v3/config`、`/enterprises/personal/models`）
+是零计费只读 GET，但原实现用 `PickExcludingForRealm`，会把 0 余额/硬冷却号全部排除 →
+额度耗尽后 `/v1/models` 与面板把 global 模型**整片隐藏**，客户端连 `global:hy3` 都看不到。
+`PickForProbe` 忽略保留积分与 `CoolHard`，且**不更新 `lastUsed`/`usedSeq`**（探测不应影响
+业务选号的 LRU 与防惊群序列），不占在途租约。
+
+### 验证（2026-11-12 线上，`docker compose up -d --build` 一次通过）
+
+- 构建：`golang:1.23-alpine` 容器 `go test ./...` **13 个包全绿**（含新增
+  `internal/pool/free_models_test.go` 5 个用例：白名单匹配 / 保留积分豁免 / CoolHard 豁免且
+  CoolSoft+熔断不豁免 / 端到端选号 / PickForProbe 不动 LRU）。
+- `/status`：11 个 global 号 `reserve_blocked=true` + `reserve_exempt_models=["hy3"]`。
+- `/v1/models`：从 19 条（纯 CN）恢复到 **55 条，其中 global 36 条**。
+- 真实调用：
+
+```
+POST /v1/chat/completions {"model":"global:hy3", max_tokens:600}
+→ HTTP 200  content="1+1等于2。"  usage.credit=0  quota.percent=0
+日志：#001 ... | global:hy3 | sync | 200 | 4kercc@gmail.com(7e592346)
+      #003 ... | global:hy3 | sync | 200 | ralphjdtmcmenemy9@gmail.com(a9bdcdc6)   ← 0 余额号轮换正常
+POST /v1/chat/completions {"model":"global:deepseek-v4.1-flash"}
+→ HTTP 503 no_healthy_account                                              ← 付费模型仍被正确拦下
+```
+
+### 回滚
+
+1. 代码：`git revert 86ea746 fde8570`（或 `git reset --hard f0c5bb2`）后
+   `docker compose up -d --build`；账号 `auths/`、`data/`、`config.json` 均为挂载，不受影响。
+2. 只关豁免不改代码：`config.json` 写 `"free_models": []`（空数组 = 关闭，热生效，
+   下一次选号即回到「全部按付费模型拦」）。
+3. 只想换名单：改 `free_models` 数组即可（如 `["global:hy3","global:另一个免费模型"]`）。
+
+### 遗留
+
+- `hy3` 是纯推理模型，短 `max_tokens` 会被 `reasoning_content` 吃满（`finish_reason=length`、
+  `content` 为空）；客户端需给足输出预算（实测 600 够）。
+- 白名单是**硬编码配置**，不跟上游倍率表自动同步。新增免费模型前先实测：
+  `usage.credit == 0` 且 0 余额下不返回 14018。
+- `reserve_credits` 语义不变：仍对付费模型生效，本次没动阈值。
