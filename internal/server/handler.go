@@ -410,8 +410,13 @@ func (h *Handler) modelList() []map[string]any {
 // 返回的 acct 供调用方在同一账号上取富 ModelInfo（FetchGlobalModelInfos 与
 // FetchGlobalModels 共享缓存，不会触发第二次上游探测）。
 // GlobalEnabled=false 时 modelList 已不进入本分支（逃生门在调用方 gate）。
+//
+// 用 PickForProbe 而非 PickExcludingForRealm：目录探测是零计费只读 GET，0 余额 /
+// 余额不足硬冷却中的账号同样能查（上游 /v3/config 不扣额度）。用业务选号口径会把
+// 这些账号排除，表现为「额度用尽后 /v1/models 里 global 模型整片消失」，客户端连
+// global:hy3 这种免费模型都看不到。
 func (h *Handler) fetchGlobalModels() ([]string, *auth.Auth) {
-	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "global")
+	acct := h.cfg.Pool.PickForProbe("global")
 	if acct == nil {
 		return nil, nil
 	}

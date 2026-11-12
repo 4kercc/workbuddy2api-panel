@@ -38,6 +38,41 @@ func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm stri
 	return p.pick(tried, reqModel, realm)
 }
 
+// PickForProbe 返回指定域的一个账号，专供**零计费**的上游只读调用（模型目录探测等）。
+//
+// 与 pick 的三点差异，都是刻意的：
+//   - 忽略保留积分与「余额不足」硬冷却：0 余额账号照样能查目录（上游 get-user-resource
+//     才扣费，/v3/config、/enterprises/personal/models 都不扣），否则余额见底后连
+//     「池里有哪些模型」都探测不出来，客户端看不到 global:hy3；
+//   - 不更新 lastUsed / usedSeq：探测不该影响业务选号的 LRU 与防惊群序列；
+//   - 不占在途租约：探测是一次短只读 GET，无 Acquire/Release 配对。
+//
+// 优先健康号（含免费模型豁免口径之外的纯健康判定），没有则退到任意非禁用号。
+func (p *Pool) PickForProbe(realm string) *auth.Auth {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	var fallback *entry
+	for _, e := range p.byUID {
+		if e.disabled {
+			continue
+		}
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if e.healthyEx(now, true) {
+			return e.a
+		}
+		if fallback == nil {
+			fallback = e
+		}
+	}
+	if fallback != nil {
+		return fallback.a
+	}
+	return nil
+}
+
 // pick 在 healthy 候选集中按权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
 // reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效）。
 // realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域）。
@@ -46,9 +81,10 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	defer p.mu.Unlock()
 	now := time.Now()
 	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
-	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
-	if reqModel != "" {
-		healthyOf = func(e *entry) bool { return realmOK(e) && e.healthyForModel(now, reqModel) }
+	// 模型感知健康口径：reqModel 为空时退化为账号级 healthy（modelCooled 恒 false）；
+	// 命中免费模型白名单时额外豁免「余额不足」硬冷却（见 healthyEx）。
+	healthyOf := func(e *entry) bool {
+		return realmOK(e) && e.healthyForModelEx(now, reqModel, p.isFreeModel(e.a.Realm(), reqModel))
 	}
 	var cands []*entry
 	for uid, e := range p.byUID {
@@ -65,15 +101,15 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		if p.inFlightFull(e) {
 			continue // 在途占满：跳过（max=0 不限时不触发）
 		}
-		if p.reserveBlocked(e) {
-			continue // 保留积分停牌：余额已知且低于阈值 → 停止接单（防打到 0 触发上游短信）
+		if p.reserveBlocked(e, reqModel) {
+			continue // 保留积分停牌：余额已知且低于阈值 → 停止接单（免费模型白名单除外）
 		}
 		cands = append(cands, e)
 	}
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, now, realm)
+		return p.pickEarliestExpiryLocked(tried, now, realm, reqModel)
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
 	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
@@ -234,7 +270,11 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm string) *auth.Auth {
+//
+// 免费模型（reqModel 命中 pool.free_models）在本兜底里同样豁免：CoolHard「余额不足」
+// 冷却与保留积分都不拦它——上游对 0 倍率模型不扣额度，0 余额号照样能跑。
+func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, reqModel string) *auth.Auth {
+	freeFor := func(e *entry) bool { return p.isFreeModel(e.a.Realm(), reqModel) }
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
@@ -246,13 +286,13 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		if e.disabled {
 			continue // 禁用的账号永不参与兜底
 		}
-		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
+		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) && !freeFor(e) {
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
 		}
 		if p.inFlightFull(e) {
 			continue
 		}
-		if p.reserveBlocked(e) {
+		if p.reserveBlocked(e, reqModel) {
 			continue // 保留积分停牌号连兜底也不接单：兜底同样会真实消耗余额
 		}
 		exp := e.expiry(now)

@@ -87,6 +87,10 @@ type Status struct {
 	// ReserveBlocked 保留积分停牌：余额已知且 <= pool.reserve_credits，已停止接单
 	// （仍可签到/猫猫旅行，充值后自动恢复）。面板据此标「保留积分」。
 	ReserveBlocked  bool       `json:"reserve_blocked,omitempty"`
+	// ReserveExemptModels 该账号所在域的免费模型白名单（pool.free_models 中适用的条目）。
+	// 非空时「保留积分」只是**对付费模型**停牌：这些模型仍可调用（上游不扣额度）。
+	// 面板用它把提示写清楚，避免「明明标了停牌却还能跑」的困惑。
+	ReserveExemptModels []string `json:"reserve_exempt_models,omitempty"`
 	SuccessCount    int64      `json:"success_count,omitempty"`
 	ErrTotal        int64      `json:"err_total,omitempty"`
 	LastSuccessTime time.Time  `json:"last_success,omitempty"`
@@ -266,11 +270,23 @@ func (e *entry) modelCostOf(model string, now time.Time) (modelCostEntry, bool) 
 // 连败降权与冷却/熔断同入本判定（取更长者不叠加：三个截止是并列的或门，
 // 只要任一未到期即不可选，天然「并存取更远者」——不需要显式比较长短）。
 func (e *entry) healthy(now time.Time) bool {
+	return e.healthyEx(now, false)
+}
+
+// healthyEx 同 healthy，exemptCreditCooldown=true 时**忽略 CoolHard（余额不足）硬冷却**。
+//
+// 仅用于命中「免费模型」白名单的请求：上游对真 0 倍率模型既不扣额度也不要求余额 > 0，
+// 余额耗尽的号照样能跑（实测 global:hy3 在 0/100 余额下 200、usage.credit=0）。其余
+// 惩罚维度照常生效——CoolSoft（限流）仍拦、熔断/连败降权仍拦、disabled 仍拦，避免
+// 把「余额不足」的豁免扩大成「一切惩罚都豁免」。
+func (e *entry) healthyEx(now time.Time, exemptCreditCooldown bool) bool {
 	if e.disabled {
 		return false
 	}
 	if !e.until.IsZero() && now.Before(e.until) {
-		return false
+		if !(exemptCreditCooldown && e.coolKind == CoolHard) {
+			return false
+		}
 	}
 	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
 		return false
@@ -314,6 +330,14 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 // 任意多个模型同时限流：被 B 限流的账号对 A 请求仍可选（A 不在 modelCooldowns 拦截
 // 且账号级 healthy 成立）。空 reqModel / 未记录模型 → 等价 healthy。
 func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
+	return e.healthyForModelEx(now, reqModel, false)
+}
+
+// healthyForModelEx 同 healthyForModel，额外接受「免费模型豁免」开关：
+// exemptCreditCooldown=true 时忽略 CoolHard（余额不足）硬冷却（见 healthyEx）。
+// 调用方按 pool.isFreeModel(realm, reqModel) 传入——豁免必须与命中白名单的
+// 具体请求模型绑定，不能无条件放开，否则付费模型也会被 0 余额号接走。
+func (e *entry) healthyForModelEx(now time.Time, reqModel string, exemptCreditCooldown bool) bool {
 	if e.disabled {
 		return false
 	}
@@ -322,7 +346,7 @@ func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 		return false
 	}
 	// 账号级冷却/熔断先判；若未冷却则由账号级健康决定。
-	return e.healthy(now)
+	return e.healthyEx(now, exemptCreditCooldown)
 }
 
 // pruneExpiredModelCosts 删除 modelCost 中已过期的条目（惰性清理，与

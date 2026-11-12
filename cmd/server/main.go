@@ -106,6 +106,7 @@ func main() {
 	if cfg.Pool.ReserveCredits != nil {
 		p.SetReserveCredits(*cfg.Pool.ReserveCredits) // 保留积分：余额 <= 阈值停止接单（0 关停，缺省 10）
 	}
+	p.SetFreeModels(cfg.Pool.FreeModels) // 免费模型白名单：命中者不受保留积分/余额硬冷却限制（缺省 global:hy3）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 
 	// live 承载可热改字段（api_key / soft_rate / 脱敏开关 / 系统提示词 / 面板汇聚 /
@@ -472,6 +473,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if newCfg.Pool.ReserveCredits != nil {
 		p.SetReserveCredits(*newCfg.Pool.ReserveCredits) // 保留积分热生效（0 关停）
 	}
+	p.SetFreeModels(newCfg.Pool.FreeModels) // 免费模型白名单热生效（空 = 关闭豁免）
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,

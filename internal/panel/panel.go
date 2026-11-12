@@ -283,19 +283,19 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// global 域：路由开关开且有可用 global 账号才查（独立目录端点，FetchGlobalModelInfos；
+	// global 域：路由开关开且有 global 账号才查（独立目录端点，FetchGlobalModelInfos；
 	// Upstream.GlobalEnabled 是探测侧同一道闸，与 main 装配的 config global.enabled 一致）。
+	// 用 PickForProbe：目录探测是零计费只读 GET，账号余额见底（保留积分/硬冷却）时
+	// 仍要能看到目录，否则面板与 /v1/models 会同时把 global 模型整片隐藏。
 	if p.cfg.Upstream.GlobalEnabled {
-		if uids := p.cfg.Pool.AvailableUIDsForRealm("global"); len(uids) > 0 {
-			if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
-				infos := p.cfg.Upstream.FetchGlobalModelInfos(acct)
-				if len(infos) == 0 {
-					fetchErrs = append(fetchErrs, "global: 上游未返回可用模型")
-				} else {
-					efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
-					for _, mi := range infos {
-						out = append(out, panelModelEntry("global", mi, efforts[mi.ID], defaults[mi.ID], p.cfg.Upstream.HTTP))
-					}
+		if acct := p.cfg.Pool.PickForProbe("global"); acct != nil {
+			infos := p.cfg.Upstream.FetchGlobalModelInfos(acct)
+			if len(infos) == 0 {
+				fetchErrs = append(fetchErrs, "global: 上游未返回可用模型")
+			} else {
+				efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
+				for _, mi := range infos {
+					out = append(out, panelModelEntry("global", mi, efforts[mi.ID], defaults[mi.ID], p.cfg.Upstream.HTTP))
 				}
 			}
 		}

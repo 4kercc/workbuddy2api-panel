@@ -3,6 +3,7 @@
 package pool
 
 import (
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,6 +43,12 @@ type Pool struct {
 	// 仍留在池中照常签到/猫猫旅行，充值后自动恢复。只拦已知余额（creditsTotal > 0）
 	// ——从未查过余额的账号不受影响，否则全新装机看起来整池不可用。
 	reserveCredits int64
+	// freeModels 免费模型白名单（SetFreeModels 注入；空 = 全部按付费模型处理）。
+	// 命中规则的请求不受「保留积分」与「余额不足硬冷却」限制：上游对真 0 倍率模型
+	// （实测 global:hy3，usage.credit=0）既不扣额度、也不要求余额 > 0，0 余额账号
+	// 照样能跑；不豁免的话这些号会被本地两道闸永久挡死，白白浪费免费额度。
+	// 规则形如 "global:hy3"（realm:model 精确匹配）或 "hy3"（不限域）。
+	freeModels []freeModelRule
 	// degradeThreshold / degradeCooldown / degradeCooldownMax 连败降权参数
 	// （SetDegrade 注入；默认值见 defaultDegrade*，issue #114）。
 	degradeThreshold   int
@@ -158,6 +165,78 @@ func (p *Pool) SetReserveCredits(v int64) {
 		return
 	}
 	p.reserveCredits = v
+}
+
+// freeModelRule 一条免费模型规则：Realm 为空表示不限域；Model 必填。
+// 归一化时统一小写（上游模型名恒小写；配置写成 HY3 也能命中）。
+type freeModelRule struct {
+	Realm string
+	Model string
+}
+
+// SetFreeModels 注入「免费模型」白名单（config pool.free_models 注入；空 = 关闭豁免）。
+// 条目支持 "realm:model"（精确匹配，如 "global:hy3"）与 "model"（不限域）。
+// 与 SetReserveCredits 同风格：不入 state.json，config 是事实源，热改由 main 重新注入。
+func (p *Pool) SetFreeModels(models []string) {
+	rules := make([]freeModelRule, 0, len(models))
+	for _, raw := range models {
+		s := strings.ToLower(strings.TrimSpace(raw))
+		if s == "" {
+			continue
+		}
+		realm, model := "", s
+		if i := strings.IndexByte(s, ':'); i > 0 && i < len(s)-1 {
+			realm, model = s[:i], s[i+1:]
+		}
+		rules = append(rules, freeModelRule{Realm: realm, Model: model})
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.freeModels = rules
+}
+
+// isFreeModel 报告 (realm, model) 是否命中免费模型白名单。调用方须持锁。
+// model 为空（状态查询/目录探测等无模型上下文的路径）恒 false——豁免只对明确请求的
+// 免费模型生效，不能因为"没带模型"就放行 0 余额账号。
+func (p *Pool) isFreeModel(realm, model string) bool {
+	if model == "" || len(p.freeModels) == 0 {
+		return false
+	}
+	m := strings.ToLower(strings.TrimSpace(model))
+	for _, r := range p.freeModels {
+		if r.Model != m {
+			continue
+		}
+		if r.Realm == "" || r.Realm == realm {
+			return true
+		}
+	}
+	return false
+}
+
+// freeModelsForRealmLocked 返回该域适用的免费模型名（去重、稳定排序），供面板在
+// 「保留积分」提示里说明「哪些模型仍可调用」。调用方须持锁。
+func (p *Pool) freeModelsForRealmLocked(realm string) []string {
+	if len(p.freeModels) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(p.freeModels))
+	out := make([]string, 0, len(p.freeModels))
+	for _, r := range p.freeModels {
+		if r.Realm != "" && r.Realm != realm {
+			continue
+		}
+		if seen[r.Model] {
+			continue
+		}
+		seen[r.Model] = true
+		out = append(out, r.Model)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sort.Strings(out)
+	return out
 }
 
 // CostExploreStatus 透出探索台账（/status 用）：累计探索事件数 + 各 (域, 模型)

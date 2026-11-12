@@ -326,7 +326,7 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
-		if !e.healthyForModel(now, model) {
+		if !e.healthyForModelEx(now, model, p.isFreeModel(e.a.Realm(), model)) {
 			continue
 		}
 		if p.inFlightFull(e) {
@@ -350,7 +350,7 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 		return nil
 	}
 	now := time.Now()
-	if !e.healthyForModel(now, model) {
+	if !e.healthyForModelEx(now, model, p.isFreeModel(e.a.Realm(), model)) {
 		return nil
 	}
 	if p.inFlightFull(e) {
@@ -380,17 +380,22 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 	return e.a
 }
 
-// reserveBlocked 报告账号是否因「保留积分」停牌（不再接单）。调用方须持锁。
+// reserveBlocked 报告账号是否因「保留积分」停牌（不再接单）。reqModel 为本次请求
+// 的裸模型名（空 = 无模型上下文，按「所有模型都拦」处理）。调用方须持锁。
 //
 // 阈值 0 = 关闭；只拦**已知**余额（creditsTotal > 0，与 Status.CreditsTotal 的
 // 「0 = 未知」同口径）——从未查过余额的账号不受影响，否则全新装机看起来整池不可用。
 //
-// 与参考实现（fork misakano7545）的差异：他们还有一条「请求模型是免费档时豁免」的
-// 分支（见底号把最后额度留给免费模型）。本 fork 的 pool 没有上游模型倍率表
-// （modelRateOf），判不出「免费档」，故不做该豁免——宁可对免费模型也保守拦下，
-// 也不引一张不完整的倍率表来做半截判断。
-func (p *Pool) reserveBlocked(e *entry) bool {
-	return p.reserveCredits > 0 && e.creditsTotal > 0 && e.credits <= p.reserveCredits
+// 免费模型豁免：reqModel 命中 pool.free_models（如 "global:hy3"）时不受限。上游对
+// 真 0 倍率模型不扣额度、也不要求余额 > 0（实测 0/100 的 global 号调 hy3 返回 200
+// 且 usage.credit=0），拦下只会白扔免费额度。比对的是配置白名单而非上游倍率表——
+// 参考实现（fork misakano7545）用 modelRateOf 判「免费档」，本 fork 不引那张不完整
+// 的倍率表（global 目录的 x0.00 与真实扣费不一致，见 project.md），改为显式白名单。
+func (p *Pool) reserveBlocked(e *entry, reqModel string) bool {
+	if p.reserveCredits <= 0 || e.creditsTotal <= 0 || e.credits > p.reserveCredits {
+		return false
+	}
+	return !p.isFreeModel(e.a.Realm(), reqModel)
 }
 
 // CountsDetailed 返回 total/healthy/cooling/disabled/inFlightFull 五类计数。
@@ -497,7 +502,10 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
 		Reason:            e.reason,
 		Disabled:          e.disabled,
-		ReserveBlocked:    p.reserveBlocked(e),
+		ReserveBlocked:    p.reserveBlocked(e, ""),
+		// 免费模型白名单（本域适用）：面板据此把「保留积分」提示写成
+		//「付费模型停牌，免费模型仍可用」，而不是笼统说账号停用。
+		ReserveExemptModels: p.freeModelsForRealmLocked(e.a.Realm()),
 		SuccessCount:      e.successCount,
 		ErrTotal:          e.errTotal,
 		TokenUsage:        e.tokenUsage,

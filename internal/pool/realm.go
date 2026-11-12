@@ -40,7 +40,7 @@ func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 		if realm != "" && e.a.Realm() != realm {
 			continue
 		}
-		if !e.healthyForModel(now, model) {
+		if !e.healthyForModelEx(now, model, p.isFreeModel(e.a.Realm(), model)) {
 			continue
 		}
 		if p.inFlightFull(e) {

@@ -198,6 +198,13 @@ type Config struct {
 		// 照常签到/猫猫旅行，充值后自动恢复），避免余额被用到 0 触发上游提醒短信。
 		// 用指针区分「未配置」与「显式 0」：nil → 缺省 10；0 = 关闭；负值 → 归 0。
 		ReserveCredits *int64 `json:"reserve_credits"`
+		// FreeModels 免费模型白名单：命中者不受「保留积分」与「余额不足硬冷却」限制。
+		// 上游对真 0 倍率模型既不扣额度也不要求余额 > 0（实测 global:hy3 在 0/100 余额
+		// 下仍 200 且 usage.credit=0），这类号被本地两道闸挡死只会白扔免费额度。
+		// 条目支持 "realm:model"（精确匹配）与 "model"（不限域）；缺省 ["global:hy3"]。
+		// 注意：**不要**把目录标 x0.00 但实际扣费的模型写进来（如国际版
+		// deepseek-v4.1-flash：目录报 0 倍率，实测照常烧额度），判据以实测 usage.credit=0 为准。
+		FreeModels []string `json:"free_models"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -225,6 +232,13 @@ type Config struct {
 // defaultReserveCredits 保留积分缺省阈值（pool.reserve_credits 未配置时生效）。
 // 余额 <= 该值的账号停止接单：避免余额被用到 0 触发上游提醒短信。
 const defaultReserveCredits = int64(10)
+
+// defaultFreeModels 免费模型缺省白名单（pool.free_models 未配置时生效）。
+// 实测依据（2026-11-12）：global 域 hy3 在余额 0/100 的账号上仍返回 200，
+// usage.credit=0，且不触发 14018「Credits exhausted」——上游对真 0 倍率模型
+// 不扣额度、也不要求余额 > 0。写进缺省值是为了让 0 余额的国际号在月度额度耗尽后
+// 仍能承接免费流量（否则会被保留积分 + 硬冷却永久挡死）。
+var defaultFreeModels = []string{"global:hy3"}
 
 // Default 默认配置。
 func Default() *Config {
@@ -284,6 +298,8 @@ func Default() *Config {
 	// 用户看得见、改得动；缺省值不写进文件的话没人知道有这功能）。
 	rc := defaultReserveCredits
 	c.Pool.ReserveCredits = &rc
+	// 免费模型缺省白名单（global:hy3）：0 余额账号仍可承接的免费流量。
+	c.Pool.FreeModels = append([]string(nil), defaultFreeModels...)
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"

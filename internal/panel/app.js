@@ -173,8 +173,15 @@ function renderAccounts(list) {
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
     /* 保留积分停牌：账号状态机是健康的（所以显示「可用」），但余额已知且 <= 阈值，
-       已停止接单——不标出来会让人以为"这号明明可用为什么没流量"（见 pool.reserve_credits）。 */
-    if (s.reserve_blocked) tag += '<span class="tag warn" title="余额已低于保留积分阈值，停止接单（仍可签到/猫猫旅行，充值后自动恢复）">保留积分</span>';
+       已停止接单——不标出来会让人以为"这号明明可用为什么没流量"（见 pool.reserve_credits）。
+       免费模型白名单（pool.free_models）非空时只是**付费模型**停牌，这些模型仍可调用，
+       提示里写清楚，避免"标了停牌却还能跑"的困惑。 */
+    if (s.reserve_blocked) {
+      const ex = s.reserve_exempt_models || [];
+      const tip = '余额已低于保留积分阈值，停止接单（仍可签到/猫猫旅行，充值后自动恢复）'
+        + (ex.length ? '\n免费模型不受此限，仍可调用：' + ex.join('、') : '');
+      tag += '<span class="tag warn" title="' + esc(tip) + '">保留积分</span>';
+    }
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
